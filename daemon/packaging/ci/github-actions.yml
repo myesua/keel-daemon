@@ -1,0 +1,116 @@
+# =============================================================================
+# Keel — reference CI workflow for building both desktop installers.
+#
+# The macOS DMG can only be built on a Mac and the Windows installer on a
+# Windows machine. If you don't own both, copy this file into a GitHub repo
+# containing the daemon/ folder (as .github/workflows/release.yml) and every
+# push to a tag like v0.1.0 produces downloadable assets:
+#   - Keel.dmg       (macOS, universal: Apple Silicon + Intel)
+#   - KeelSetup.exe  (Windows x64)
+#
+# On a tag push the workflow also publishes a GitHub Release and attaches both
+# installers as release assets.
+#
+# Optional signing secrets (unsigned builds still work — see packaging/README.md):
+#   MACOS_CERT_P12 / MACOS_CERT_PASSWORD  base64 .p12 Developer ID cert + password
+#   MACOS_SIGN_IDENTITY                   "Developer ID Application: … (TEAMID)"
+#   NOTARY_APPLE_ID / NOTARY_TEAM_ID / NOTARY_PASSWORD   for notarytool
+#   KEEL_COMPANION_URL                    web-app URL for the tray menu (plain var)
+# =============================================================================
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Import signing certificate (only when secrets are set)
+        if: ${{ secrets.MACOS_CERT_P12 != '' }}
+        run: |
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security create-keychain -p ci-temp build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci-temp build.keychain
+          security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci-temp build.keychain
+          echo "KEEL_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+
+      - name: Store notarization credentials (only when secrets are set)
+        if: ${{ secrets.NOTARY_APPLE_ID != '' }}
+        run: |
+          xcrun notarytool store-credentials keel-notary \
+            --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD"
+          echo "KEEL_NOTARY_PROFILE=keel-notary" >> "$GITHUB_ENV"
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+
+      - name: Build Keel.dmg
+        working-directory: daemon
+        run: ./packaging/macos/build-macos.sh
+        env:
+          KEEL_COMPANION_URL: ${{ vars.KEEL_COMPANION_URL }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Keel-macOS
+          path: daemon/dist/Keel.dmg
+
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        run: choco install nsis -y
+
+      - name: Build KeelSetup.exe
+        working-directory: daemon
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build-windows.ps1
+        env:
+          KEEL_COMPANION_URL: ${{ vars.KEEL_COMPANION_URL }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Keel-Windows
+          path: daemon/dist/KeelSetup.exe
+
+  release:
+    needs: [macos-dmg, windows-installer]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: Keel-macOS
+          path: dist
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: Keel-Windows
+          path: dist
+
+      - name: Publish GitHub Release with installers
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Keel.dmg
+            dist/KeelSetup.exe

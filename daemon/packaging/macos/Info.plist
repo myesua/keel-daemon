@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Keel</string>
+	<key>CFBundleDisplayName</key>
+	<string>Keel</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.audos.keel</string>
+	<key>CFBundleExecutable</key>
+	<string>keel-daemon</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<!-- Menubar-only app: no Dock icon, no Cmd-Tab entry. The tray shell
+	     also sets the Accessory activation policy at runtime; this makes the
+	     bundle itself agree. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Keel — the agent's hands on your real browser.</string>
+</dict>
+</plist>

@@ -54,14 +54,14 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
         }
     });
 
-    let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
-        use tao::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        // Menubar-only app: no Dock icon, no app switcher entry.
-        builder.with_activation_policy(ActivationPolicy::Accessory);
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        // Menubar-only app: no Dock icon, no app switcher entry. tao 0.30 sets
+        // the policy on the built event loop (before run), not on the builder.
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
-    let event_loop = builder.build();
 
     // Menu events arrive on muda's own channel; forward them into the event
     // loop so ControlFlow::Wait still wakes up on clicks.

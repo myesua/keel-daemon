@@ -16,6 +16,10 @@
 #   MACOS_SIGN_IDENTITY                   "Developer ID Application: … (TEAMID)"
 #   NOTARY_APPLE_ID / NOTARY_TEAM_ID / NOTARY_PASSWORD   for notarytool
 #   KEEL_COMPANION_URL                    web-app URL for the tray menu (plain var)
+#
+# Note: the `secrets` context cannot be referenced from a step `if:` condition,
+# so each optional secret is mapped to a job-level env var and the conditional
+# tests `env.*` instead (empty when the secret is unset → the step is skipped).
 # =============================================================================
 name: release
 
@@ -30,12 +34,19 @@ permissions:
 jobs:
   macos-dmg:
     runs-on: macos-latest
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+      NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+      NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Import signing certificate (only when secrets are set)
-        if: ${{ secrets.MACOS_CERT_P12 != '' }}
+        if: ${{ env.MACOS_CERT_P12 != '' }}
         run: |
           echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
           security create-keychain -p ci-temp build.keychain
@@ -44,21 +55,13 @@ jobs:
           security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k ci-temp build.keychain
           echo "KEEL_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
 
       - name: Store notarization credentials (only when secrets are set)
-        if: ${{ secrets.NOTARY_APPLE_ID != '' }}
+        if: ${{ env.NOTARY_APPLE_ID != '' }}
         run: |
           xcrun notarytool store-credentials keel-notary \
             --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" --password "$NOTARY_PASSWORD"
           echo "KEEL_NOTARY_PROFILE=keel-notary" >> "$GITHUB_ENV"
-        env:
-          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
-          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
-          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
 
       - name: Build Keel.dmg
         working-directory: daemon

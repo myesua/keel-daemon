@@ -59,7 +59,7 @@ Section "Keel" SecMain
   ; Uninstaller + Add/Remove Programs entry
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "Keel"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "0.1.5"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "0.1.6"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "Keel"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" '"$INSTDIR\${APP_EXE}"'
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'

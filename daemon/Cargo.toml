@@ -1,6 +1,6 @@
 [package]
 name = "keel-daemon"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Keel's hands on the user's real browser — CDP client + local MCP server + companion bridge"
 

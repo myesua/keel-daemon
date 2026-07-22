@@ -1,15 +1,15 @@
-# Keel daemon — test results (v0.1.5)
+# Keel daemon — test results (v0.1.6)
 
 Run with `cd daemon && ./tests/run-tests.sh` on Linux x86_64 (rustc 1.97.1,
-Google Chrome headless for the CDP test). All five required behavior tests
-pass — 19/19 checks, 0 failures.
+Google Chrome headless for the CDP test, Xvfb for the tray runtime check).
+All five required behavior tests pass — 19/19 checks, 0 failures.
 
 | # | Test | Result | Evidence |
 |---|------|--------|----------|
-| 1 | HTTP bridge starts, `GET /keel/health` answers | PASS | `{"status":"ok","ok":true,"service":"keel-daemon","version":"0.1.5","browser_connected":false,"debug_port":9222}` |
+| 1 | HTTP bridge starts, `GET /keel/health` answers | PASS | `{"status":"ok","ok":true,"service":"keel-daemon","version":"0.1.6","browser_connected":false,"debug_port":9222}` |
 | 2 | `GET /keel/tools` returns tool list | PASS | 9 tools (`open_tab`, `list_tabs`, `focus_tab`, `read_dom`, `highlight_element`, `click_element`, `fill_input`, `scroll`, `get_screenshot`) |
 | 3 | Daemon does NOT open Chrome | PASS | 0 chrome processes before and after daemon start; log shows `Chrome not connected — start Chrome with --remote-debugging-port=9222…`; bridge still serves on 8791 |
-| 4 | Tray icon + menu items | PASS* | Tray build compiles; startup log prints `tray menu: ["Keel — Chrome not connected", "Open Keel", "CDP Status: Not Connected", separator, "Quit Keel"]` (run under Xvfb) |
+| 4 | Tray icon + menu items | PASS* | Tray build compiles; running the tray binary (under Xvfb) logs `tray menu: ["Keel — Chrome not connected", "Open Keel", "CDP Status: Not Connected", separator, "Quit Keel"]` |
 | 5 | CDP attaches when Chrome runs with `--remote-debugging-port=9222` | PASS | `curl localhost:9222/json` returns the tab list; daemon logs `CDP connected to Chrome on port 9222`; `/keel/health` flips to `"browser_connected":true` |
 
 \* Test 4 caveat, reported honestly: this suite runs on headless Linux, so the

@@ -62,9 +62,9 @@ cargo build --release --features tray --target x86_64-apple-darwin
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 lipo -create \
-  target/aarch64-apple-darwin/release/keel-daemon \
-  target/x86_64-apple-darwin/release/keel-daemon \
-  -output "$APP/Contents/MacOS/keel-daemon"
+  target/aarch64-apple-darwin/release/keel \
+  target/x86_64-apple-darwin/release/keel \
+  -output "$APP/Contents/MacOS/keel"
 
 cp "$SCRIPT_DIR/Info.plist" "$APP/Contents/Info.plist"
 
@@ -97,7 +97,7 @@ fi
 if [[ -n "${KEEL_SIGN_IDENTITY:-}" ]]; then
   echo "==> Code-signing with: $KEEL_SIGN_IDENTITY"
   codesign --force --options runtime --timestamp \
-    --sign "$KEEL_SIGN_IDENTITY" "$APP/Contents/MacOS/keel-daemon"
+    --sign "$KEEL_SIGN_IDENTITY" "$APP/Contents/MacOS/keel"
   codesign --force --options runtime --timestamp \
     --sign "$KEEL_SIGN_IDENTITY" "$APP"
   codesign --verify --deep --strict "$APP"

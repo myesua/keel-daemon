@@ -1,8 +1,13 @@
 [package]
 name = "keel-daemon"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "Keel's hands on the user's real browser — CDP client + local MCP server + companion bridge"
+
+# The shipped binary is `keel` (Keel.app on macOS, keel.exe on Windows).
+[[bin]]
+name = "keel"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"

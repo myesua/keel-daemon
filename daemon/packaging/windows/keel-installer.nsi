@@ -1,12 +1,12 @@
 ; =============================================================================
 ; Keel — Windows installer (NSIS 3.x)
 ;
-; Installs the tray build of keel-daemon.exe, adds Start Menu shortcuts,
+; Installs the tray build of keel.exe, adds Start Menu shortcuts,
 ; registers Keel to start at login (HKCU Run key — per-user, no admin-only
 ; service), and offers to launch it right away. Result: install, launch,
 ; tray icon appears, daemon is running. No terminal.
 ;
-; Build (after build-windows.ps1 has produced keel-daemon.exe next to this
+; Build (after build-windows.ps1 has produced keel.exe next to this
 ; script):   makensis keel-installer.nsi
 ; Output:    KeelSetup.exe
 ; =============================================================================
@@ -20,7 +20,7 @@ Unicode True
 RequestExecutionLevel user
 InstallDir "$LOCALAPPDATA\Keel"
 
-!define APP_EXE "keel-daemon.exe"
+!define APP_EXE "keel.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Keel"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -59,7 +59,7 @@ Section "Keel" SecMain
   ; Uninstaller + Add/Remove Programs entry
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayName" "Keel"
-  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "0.1.0"
+  WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "0.1.5"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "Keel"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayIcon" '"$INSTDIR\${APP_EXE}"'
   WriteRegStr HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
@@ -78,6 +78,5 @@ Section "Uninstall"
   RMDir "$SMPROGRAMS\Keel"
   DeleteRegValue HKCU "${RUN_KEY}" "Keel"
   DeleteRegKey HKCU "${UNINST_KEY}"
-  ; The Keel Chrome profile (%USERPROFILE%\.glide) is intentionally KEPT —
-  ; it holds the user's logins/cookies for future sessions.
+  ; Keel never touches the user's Chrome profile — nothing else to clean up.
 SectionEnd

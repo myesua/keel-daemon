@@ -1,8 +1,8 @@
 # keel-daemon
 
-Keel's hands on your real browser. A single lightweight Rust binary that:
+Keel's hands on your real browser. A single lightweight Rust binary (`keel`) that:
 
-- attaches to your **already-running Chrome** over the Chrome DevTools Protocol (CDP) using the `chromiumoxide` crate — no Playwright, no Electron, no sandboxed copy of your browser;
+- attaches to your **already-running Chrome** over the Chrome DevTools Protocol (CDP, port 9222) using the `chromiumoxide` crate — no Playwright, no Electron, no sandboxed copy of your browser. **Keel never launches Chrome**: you start Chrome with `--remote-debugging-port=9222` and Keel connects to it;
 - opens **real tabs** in that browser and works on the **live page** while you watch;
 - **highlights every element** (orange border + glow + label) *before* touching it;
 - **refuses** password and file inputs at the daemon level — those come back as `pause_required` so the agent hands the moment to you;
@@ -24,15 +24,15 @@ User flow: download → open installer → launch → open the Keel web app, it'
 
 ```bash
 cd daemon
-cargo build --release      # requires Rust 1.85+ (edition2024-capable toolchain)
-# binary at target/release/keel-daemon
+cargo build --release
+# binary at target/release/keel
 
 # desktop-app build (adds the menubar/tray shell):
 cargo build --release --features tray
 # on Linux the tray build needs GTK headers: apt install libgtk-3-dev
 ```
 
-A tray build launched with no arguments shows the tray icon; `keel-daemon headless` runs it exactly like the CLI build (useful for debugging), and `keel-daemon mcp` is unchanged.
+A tray build launched with no arguments shows the tray icon; `keel headless` runs it exactly like the CLI build (useful for debugging), and `keel mcp` is unchanged.
 
 ## Run — companion mode (default)
 
@@ -42,21 +42,24 @@ A tray build launched with no arguments shows the tray icon; `keel-daemon headle
 
 What happens on start (this is the whole "tray app" job — invisible plumbing):
 
-1. It looks for a browser already listening on the debug port (`9223` by default, override with `KEEL_DEBUG_PORT`).
-2. If none is found, it launches your installed Chrome/Chromium/Brave/Edge with `--remote-debugging-port=9223` against the persistent Keel profile at `~/.glide/chrome-profile`. (Chrome 136+ blocks CDP on the *default* profile for security; the Keel profile is still a completely real browser — sign in once, and cookies/sessions/history persist across every future session.)
-3. It serves the companion bridge at `http://127.0.0.1:8791` (`/glide/health`, `/glide/tools`, `/glide/call`). Loopback is exempt from mixed-content blocking, so the https-served companion UI can reach it. It binds to 127.0.0.1 only — nothing outside your machine can touch it.
+1. The companion bridge starts at `http://127.0.0.1:8791` (`/keel/health`, `/keel/tools`, `/keel/call`; the old `/glide/*` paths remain as aliases). Loopback is exempt from mixed-content blocking, so the https-served companion UI can reach it. It binds to 127.0.0.1 only — nothing outside your machine can touch it.
+2. It looks for a browser already listening on the CDP debug port (`9222` by default, override with `KEEL_DEBUG_PORT`) and attaches when one answers. **It never launches Chrome** — if Chrome isn't running with remote debugging, the daemon simply reports "Chrome not connected" and keeps polling.
 
-Already-running browser? Start your browser yourself with the flag and the daemon attaches instead of launching:
+To let Keel attach, start Chrome yourself with the flag:
 
 ```bash
-google-chrome --remote-debugging-port=9223
-./keel-daemon
+# macOS
+open -a "Google Chrome" --args --remote-debugging-port=9222
+# Linux
+google-chrome --remote-debugging-port=9222
 ```
+
+(Chrome 136+ blocks CDP on the default profile for security; if your Chrome refuses the flag, add `--user-data-dir=$HOME/.keel-chrome` to use a dedicated profile.)
 
 ## Run — MCP mode (Claude as the brain)
 
 ```bash
-./keel-daemon mcp
+./keel mcp
 ```
 
 Speaks MCP (JSON-RPC 2.0) over stdio. Claude Desktop / Claude Code config:
@@ -65,7 +68,7 @@ Speaks MCP (JSON-RPC 2.0) over stdio. Claude Desktop / Claude Code config:
 {
   "mcpServers": {
     "keel": {
-      "command": "/path/to/keel-daemon",
+      "command": "/path/to/keel",
       "args": ["mcp"]
     }
   }
@@ -89,7 +92,7 @@ Speaks MCP (JSON-RPC 2.0) over stdio. Claude Desktop / Claude Code config:
 ## Cross-browser
 
 - **Chrome / Chromium / Brave / Edge** — primary targets, fully supported.
-- **Firefox** — start it with `firefox --remote-debugging-port=9223`; Firefox ships CDP compatibility, so attachment works the same way. Considered experimental.
+- **Firefox** — start it with `firefox --remote-debugging-port=9222`; Firefox ships CDP compatibility, so attachment works the same way. Considered experimental.
 - **Safari** — deferred (no CDP).
 
 ## Design constraints (deliberate)

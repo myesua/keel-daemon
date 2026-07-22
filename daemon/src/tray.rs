@@ -7,11 +7,10 @@
 //! background tokio runtime.
 //!
 //! Behavior contract (what makes the tray a polite guest):
-//! - Launching Keel NEVER opens a Chrome window. The bridge starts on port
-//!   8791 and a background poller silently attaches to a browser whose
-//!   DevTools port is already answering. Until then the menu reads
-//!   "Status: Waiting for Chrome…". Chrome is only ever started on demand,
-//!   when a live-session tool call actually needs it.
+//! - Launching Keel NEVER opens a Chrome window — not at startup, not ever.
+//!   The bridge starts on port 8791 and a background poller silently attaches
+//!   to a browser whose DevTools port (9222) is already answering. Until then
+//!   the menu reads "Keel — Chrome not connected".
 //! - The menu always offers "Open Keel" — the companion web app opens in the
 //!   default browser. The URL is baked in via KEEL_COMPANION_URL at compile
 //!   time (packaging scripts), overridable at runtime, with a built-in
@@ -70,7 +69,7 @@ enum UserEvent {
 /// True when another Keel daemon already owns the companion bridge port.
 ///
 /// A plain TCP connect isn't proof (anything could squat on the port), so we
-/// ask `/glide/tools` — a static endpoint that never touches the browser —
+/// ask `/keel/tools` — a static endpoint that never touches the browser —
 /// and look for the service's own vocabulary in the reply.
 fn already_running() -> bool {
     use std::io::{Read, Write};
@@ -82,7 +81,7 @@ fn already_running() -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let req = format!(
-        "GET /glide/tools HTTP/1.1\r\nHost: 127.0.0.1:{BRIDGE_PORT}\r\nConnection: close\r\n\r\n"
+        "GET /keel/tools HTTP/1.1\r\nHost: 127.0.0.1:{BRIDGE_PORT}\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
@@ -135,8 +134,7 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
     }));
 
     // Silent browser watcher: attach to a browser whose DevTools port is
-    // already answering — NEVER launch one — and keep the status line honest.
-    // Chrome only ever starts when a live-session tool call demands it.
+    // already answering — NEVER launch one — and keep the status lines honest.
     let status_proxy = event_loop.create_proxy();
     let daemon_poll = Arc::clone(&daemon);
     runtime.spawn(async move {
@@ -151,15 +149,29 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
         }
     });
 
+    // Menu layout (top to bottom):
+    //   "Keel — Running" / "Keel — Chrome not connected"   (disabled status line)
+    //   "Open Keel"                                        (opens the web app)
+    //   "CDP Status: Connected / Not Connected"            (disabled, live)
+    //   ─────────
+    //   "Quit Keel"
     let menu = Menu::new();
+    let title_item = MenuItem::new("Keel — Chrome not connected", false, None);
+    menu.append(&title_item)?;
     let open_item = MenuItem::new("Open Keel", true, None);
     menu.append(&open_item)?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    let status_item = MenuItem::new("Status: Waiting for Chrome…", false, None);
-    menu.append(&status_item)?;
+    let cdp_item = MenuItem::new("CDP Status: Not Connected", false, None);
+    menu.append(&cdp_item)?;
     menu.append(&PredefinedMenuItem::separator())?;
     let quit_item = MenuItem::new("Quit Keel", true, None);
     menu.append(&quit_item)?;
+
+    // Log the menu structure so packaged builds can prove the tray contents
+    // without a screenshot (see Test 4 in daemon/tests/).
+    tracing::info!(
+        "tray menu: [\"{}\", \"Open Keel\", \"CDP Status: Not Connected\", separator, \"Quit Keel\"]",
+        "Keel — Chrome not connected"
+    );
 
     let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -174,7 +186,7 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
             Event::NewEvents(StartCause::Init) => {
                 match TrayIconBuilder::new()
                     .with_menu(Box::new(menu.clone()))
-                    .with_tooltip("Keel — waiting for Chrome")
+                    .with_tooltip("Keel — Chrome not connected")
                     .with_icon(keel_icon())
                     .build()
                 {
@@ -186,12 +198,21 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::BrowserStatus(connected)) => {
-                let (status, tooltip) = if connected {
-                    ("Status: Running", "Keel — connected to your browser")
+                let (title, cdp, tooltip) = if connected {
+                    (
+                        "Keel — Running",
+                        "CDP Status: Connected",
+                        "Keel — connected to Chrome",
+                    )
                 } else {
-                    ("Status: Waiting for Chrome…", "Keel — waiting for Chrome")
+                    (
+                        "Keel — Chrome not connected",
+                        "CDP Status: Not Connected",
+                        "Keel — Chrome not connected",
+                    )
                 };
-                status_item.set_text(status);
+                title_item.set_text(title);
+                cdp_item.set_text(cdp);
                 if let Some(t) = &tray {
                     let _ = t.set_tooltip(Some(tooltip));
                 }

@@ -23,7 +23,12 @@ use crate::mcp::tool_definitions;
 pub const BRIDGE_PORT: u16 = 8791;
 
 pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
+    // Canonical routes live under /keel/. The /glide/ aliases stay so any
+    // companion build still calling the old prefix keeps working.
     let app = Router::new()
+        .route("/keel/health", get(health))
+        .route("/keel/tools", get(tools))
+        .route("/keel/call", post(call))
         .route("/glide/health", get(health))
         .route("/glide/tools", get(tools))
         .route("/glide/call", post(call))
@@ -40,6 +45,7 @@ async fn health(State(daemon): State<Arc<Daemon>>) -> Json<Value> {
     // Probe only — a health check must never launch Chrome as a side effect.
     let connected = daemon.attach_if_running().await;
     Json(json!({
+        "status": "ok",
         "ok": true,
         "service": "keel-daemon",
         "version": env!("CARGO_PKG_VERSION"),

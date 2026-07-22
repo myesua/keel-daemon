@@ -1,15 +1,16 @@
 //! keel-daemon — Keel's hands on the user's real browser.
 //!
 //! A single lightweight binary with two faces (three when packaged):
-//!   `keel-daemon`        → companion mode: local HTTP bridge on 127.0.0.1:8791
-//!                           + connects/launches Chrome with CDP enabled.
+//!   `keel`               → companion mode: local HTTP bridge on 127.0.0.1:8791
+//!                           + attaches to the user's ALREADY-RUNNING Chrome
+//!                           over CDP (port 9222). Keel never launches Chrome.
 //!                           In the packaged desktop app (built with
 //!                           `--features tray`) this same default mode also
 //!                           puts a Keel icon in the menubar/system tray —
 //!                           the daemon underneath is unchanged.
-//!   `keel-daemon mcp`    → MCP stdio server for Claude (Claude Desktop /
-//!                           Claude Code config: command = keel-daemon, args = ["mcp"]).
-//!   `keel-daemon headless` → (tray builds only) companion mode without the
+//!   `keel mcp`           → MCP stdio server for Claude (Claude Desktop /
+//!                           Claude Code config: command = keel, args = ["mcp"]).
+//!   `keel headless`      → (tray builds only) companion mode without the
 //!                           tray icon — what plain `keel-daemon` does in a
 //!                           terminal build. Useful for debugging the packaged app.
 //!
@@ -43,7 +44,8 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "keel_daemon=info".into()),
+                // The binary target is `keel`, so module paths are keel::…
+                .unwrap_or_else(|_| "keel=info".into()),
         )
         .init();
 
@@ -68,10 +70,17 @@ fn main() -> Result<()> {
 
     tracing::info!("keel-daemon starting companion bridge");
     tokio_runtime()?.block_on(async move {
-        // Connect (or launch) the browser eagerly so the first tool call is fast,
-        // but don't die if the browser isn't up yet — health checks retry.
-        if let Err(e) = daemon.ensure_connected().await {
-            tracing::warn!("browser not connected yet: {e}");
+        // Probe for an already-running Chrome so the first tool call is fast.
+        // Never launch Chrome — if it isn't up, the bridge still serves and
+        // health checks keep retrying the attach.
+        if daemon.attach_if_running().await {
+            tracing::info!("CDP connected");
+        } else {
+            tracing::warn!(
+                "Chrome not connected — start Chrome with --remote-debugging-port={} \
+                 and Keel will attach automatically",
+                daemon.debug_port
+            );
         }
         http::run(daemon).await
     })

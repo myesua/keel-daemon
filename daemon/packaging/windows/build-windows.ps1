@@ -33,12 +33,12 @@ $Dist = Join-Path $DaemonDir "dist"
 Set-Location $DaemonDir
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
-Write-Host "==> Building keel-daemon.exe (release, --features tray)"
+Write-Host "==> Building keel.exe (release, --features tray)"
 cargo build --release --features tray
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 # NSIS picks the exe up from the script's own directory.
-Copy-Item "target\release\keel-daemon.exe" (Join-Path $ScriptDir "keel-daemon.exe") -Force
+Copy-Item "target\release\keel.exe" (Join-Path $ScriptDir "keel.exe") -Force
 
 Write-Host "==> Building KeelSetup.exe with NSIS"
 $makensis = Get-Command makensis -ErrorAction SilentlyContinue
@@ -57,7 +57,7 @@ if (-not $makensis) {
 if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
 
 Move-Item (Join-Path $ScriptDir "KeelSetup.exe") (Join-Path $Dist "KeelSetup.exe") -Force
-Remove-Item (Join-Path $ScriptDir "keel-daemon.exe") -Force
+Remove-Item (Join-Path $ScriptDir "keel.exe") -Force
 
 Write-Host ""
 Write-Host "Done: $Dist\KeelSetup.exe"

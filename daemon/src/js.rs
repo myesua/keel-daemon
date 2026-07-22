@@ -5,7 +5,7 @@
 //! (temporary) highlight overlay.
 
 /// Installs `window.__glideHighlight(el, label, holdMs)` — draws a rounded
-/// orange glow rectangle over an element so the user always sees what Glide
+/// orange glow rectangle over an element so the user always sees what Keel
 /// is about to touch. Returns the same function on re-injection.
 pub const HIGHLIGHT_LIB: &str = r#"
 (() => {

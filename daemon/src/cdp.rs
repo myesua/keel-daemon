@@ -1,12 +1,13 @@
 //! Browser control core: connects to the user's real Chrome over the
-//! Chrome DevTools Protocol (CDP) and implements the Glide tool set.
+//! Chrome DevTools Protocol (CDP) and implements the Keel tool set.
 //!
-//! No Playwright, no Electron, no sandboxed session: we attach to a live,
-//! already-running browser (or start one against a persistent Glide profile)
-//! so auth, cookies, history and open tabs all stay exactly where they are.
+//! No Playwright, no Electron, no sandboxed session: we ONLY attach to a
+//! live, already-running browser whose DevTools port is answering. Keel
+//! NEVER launches Chrome — the user starts Chrome themselves with
+//! `--remote-debugging-port=9222` and Keel connects to it, so auth,
+//! cookies, history and open tabs all stay exactly where they are.
 
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,9 @@ use tokio::sync::Mutex;
 
 use crate::js;
 
-const DEFAULT_DEBUG_PORT: u16 = 9223;
+/// Chrome's conventional remote-debugging port. The user starts Chrome with
+/// `--remote-debugging-port=9222`; Keel only ever attaches to it.
+const DEFAULT_DEBUG_PORT: u16 = 9222;
 
 pub struct Daemon {
     inner: Mutex<Inner>,
@@ -54,10 +57,9 @@ impl Daemon {
     /// Attach to a browser whose DevTools port is already answering — and
     /// NEVER launch one. Returns whether a browser is connected afterwards.
     ///
-    /// This is the polite probe the tray's status poller and the bridge's
-    /// health endpoint use: checking on Chrome must not have the side effect
-    /// of starting Chrome. Launching stays reserved for real tool calls
-    /// (`ensure_connected`, via `open_tab`).
+    /// This is the probe the tray's status poller and the bridge's health
+    /// endpoint use: checking on Chrome must not have the side effect of
+    /// starting Chrome (Keel never starts Chrome, anywhere).
     pub async fn attach_if_running(self: &Arc<Self>) -> bool {
         {
             let mut inner = self.inner.lock().await;
@@ -84,11 +86,14 @@ impl Daemon {
 
         let mut inner = self.inner.lock().await;
         inner.browser = Some(browser);
+        tracing::info!("CDP connected to Chrome on port {}", self.debug_port);
         true
     }
 
-    /// Attach to a running browser with an open debug port, or start Chrome
-    /// with the persistent Glide profile when nothing is listening yet.
+    /// Attach to the user's already-running browser via its DevTools port.
+    ///
+    /// Keel NEVER launches Chrome. If nothing is listening on the debug port,
+    /// this fails with instructions the companion UI can surface to the user.
     pub async fn ensure_connected(self: &Arc<Self>) -> Result<()> {
         {
             let mut inner = self.inner.lock().await;
@@ -104,13 +109,14 @@ impl Daemon {
             }
         }
 
-        let ws_url = match debugger_ws_url(self.debug_port).await {
-            Ok(url) => url,
-            Err(_) => {
-                launch_chrome(self.debug_port)?;
-                wait_for_debugger(self.debug_port, Duration::from_secs(20)).await?
-            }
-        };
+        let port = self.debug_port;
+        let ws_url = debugger_ws_url(port).await.with_context(|| {
+            format!(
+                "Chrome is not reachable on the DevTools port. Start Chrome with \
+                 --remote-debugging-port={port} and try again — Keel never launches \
+                 Chrome for you."
+            )
+        })?;
 
         let (browser, mut handler) = Browser::connect(ws_url)
             .await
@@ -119,6 +125,7 @@ impl Daemon {
 
         let mut inner = self.inner.lock().await;
         inner.browser = Some(browser);
+        tracing::info!("CDP connected to Chrome on port {port}");
         Ok(())
     }
 
@@ -127,7 +134,7 @@ impl Daemon {
         let id = inner
             .current_tab
             .clone()
-            .ok_or_else(|| anyhow!("no Glide tab is open yet — call open_tab with a URL first"))?;
+            .ok_or_else(|| anyhow!("no Keel tab is open yet — call open_tab with a URL first"))?;
         let page = inner
             .tabs
             .get(&id)
@@ -136,7 +143,7 @@ impl Daemon {
         Ok((id, page))
     }
 
-    /// Dispatch a Glide tool call. Shared by the MCP stdio server and the
+    /// Dispatch a Keel tool call. Shared by the MCP stdio server and the
     /// local HTTP bridge so both brains use identical hands.
     pub async fn call_tool(self: &Arc<Self>, name: &str, args: &Value) -> Result<Value> {
         match name {
@@ -234,7 +241,7 @@ impl Daemon {
 
     async fn highlight_element(self: &Arc<Self>, args: &Value) -> Result<Value> {
         let selector = require_str(args, "selector")?;
-        let label = args.get("label").and_then(Value::as_str).unwrap_or("Glide");
+        let label = args.get("label").and_then(Value::as_str).unwrap_or("Keel");
         let hold_ms = args.get("hold_ms").and_then(Value::as_u64).unwrap_or(1100);
         let (_, page) = self.current_page().await?;
         run_highlight(&page, selector, label, hold_ms).await?;
@@ -470,84 +477,6 @@ async fn debugger_ws_url(port: u16) -> Result<String> {
         .ok_or_else(|| anyhow!("DevTools endpoint returned no webSocketDebuggerUrl"))
 }
 
-async fn wait_for_debugger(port: u16, timeout: Duration) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Ok(url) = debugger_ws_url(port).await {
-            return Ok(url);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("Chrome did not expose its DevTools port within {timeout:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(400)).await;
-    }
-}
-
-fn chrome_candidates() -> Vec<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    if cfg!(target_os = "macos") {
-        candidates.extend([
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into(),
-            "/Applications/Chromium.app/Contents/MacOS/Chromium".into(),
-            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser".into(),
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".into(),
-        ]);
-    } else if cfg!(target_os = "windows") {
-        candidates.extend([
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".into(),
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".into(),
-        ]);
-    } else {
-        candidates.extend([
-            "google-chrome".into(),
-            "google-chrome-stable".into(),
-            "chromium".into(),
-            "chromium-browser".into(),
-            "brave-browser".into(),
-            "microsoft-edge".into(),
-        ]);
-    }
-    candidates
-}
-
-/// Start Chrome with the DevTools port on the persistent Glide profile.
-///
-/// Chrome 136+ refuses `--remote-debugging-port` on the DEFAULT profile
-/// for security, so Glide keeps its own persistent profile directory —
-/// still a completely real Chrome: sign in once and cookies, sessions,
-/// history and extensions persist across every future Glide session.
-fn launch_chrome(port: u16) -> Result<()> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    let profile_dir = format!("{home}/.glide/chrome-profile");
-    std::fs::create_dir_all(&profile_dir).ok();
-
-    let mut last_err: Option<std::io::Error> = None;
-    for bin in chrome_candidates() {
-        match std::process::Command::new(&bin)
-            .arg(format!("--remote-debugging-port={port}"))
-            .arg(format!("--user-data-dir={profile_dir}"))
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            // Launched on demand (a tool call needed a browser): come up
-            // quietly with no startup window stealing focus — the first
-            // visible window is the tab the tool opens.
-            .arg("--no-startup-window")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => {
-                tracing::info!("started {bin} with DevTools on port {port}");
-                return Ok(());
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(anyhow!(
-        "no Chrome/Chromium/Brave/Edge binary found (last error: {last_err:?}). \
-         Start your browser manually with --remote-debugging-port={port} and retry."
-    ))
-}
+// NOTE: there is deliberately no launch_chrome() here. Keel connects to the
+// user's already-running Chrome (started with --remote-debugging-port=9222)
+// and must never open a browser window itself.

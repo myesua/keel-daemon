@@ -4,8 +4,22 @@
 //! or launch Keel from the Start Menu (Windows) and this module puts a small
 //! icon in the menubar/tray while the real daemon — the CDP connection to the
 //! user's own Chrome plus the loopback companion bridge — runs invisibly on a
-//! background tokio runtime. The daemon's behavior is IDENTICAL to running
-//! `keel-daemon` in a terminal; the tray is only a launcher and an off switch.
+//! background tokio runtime.
+//!
+//! Behavior contract (what makes the tray a polite guest):
+//! - Launching Keel NEVER opens a Chrome window. The bridge starts on port
+//!   8791 and a background poller silently attaches to a browser whose
+//!   DevTools port is already answering. Until then the menu reads
+//!   "Status: Waiting for Chrome…". Chrome is only ever started on demand,
+//!   when a live-session tool call actually needs it.
+//! - The menu always offers "Open Keel" — the companion web app opens in the
+//!   default browser. The URL is baked in via KEEL_COMPANION_URL at compile
+//!   time (packaging scripts), overridable at runtime, with a built-in
+//!   fallback so the item never disappears.
+//! - Relaunching the app while Keel is already running is a no-op plus
+//!   feedback: the second instance detects the live bridge on port 8791,
+//!   opens the companion app so the click visibly did something, and exits
+//!   instead of fighting over the port.
 //!
 //! Platform notes:
 //! - The tray/menu event loop must own the MAIN thread (a hard macOS
@@ -16,6 +30,7 @@
 //!   stays self-contained: no bundled asset files to load at runtime.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tao::event::{Event, StartCause};
@@ -26,34 +41,83 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use crate::cdp::Daemon;
 use crate::http::BRIDGE_PORT;
 
-/// The Keel companion web app. Baked in at compile time via the
-/// KEEL_COMPANION_URL env var (the packaging scripts set it), and
-/// overridable at runtime with the same variable.
-fn companion_url() -> Option<String> {
+/// Fallback companion URL so "Open Keel" always works, even in builds where
+/// the packaging scripts didn't bake in KEEL_COMPANION_URL.
+const DEFAULT_COMPANION_URL: &str =
+    "https://app.audos.com/space/10a99f02-28e8-4834-ba8d-0af3b7561513";
+
+/// The Keel companion web app. Runtime KEEL_COMPANION_URL wins, then the
+/// value baked in at compile time by the packaging scripts, then the
+/// built-in default.
+fn companion_url() -> String {
     std::env::var("KEEL_COMPANION_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("KEEL_COMPANION_URL").map(str::to_string))
+        .or_else(|| {
+            option_env!("KEEL_COMPANION_URL")
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_COMPANION_URL.to_string())
 }
 
 enum UserEvent {
     Menu(MenuEvent),
+    /// Emitted by the background poller: is a browser attached right now?
+    BrowserStatus(bool),
+}
+
+/// True when another Keel daemon already owns the companion bridge port.
+///
+/// A plain TCP connect isn't proof (anything could squat on the port), so we
+/// ask `/glide/tools` — a static endpoint that never touches the browser —
+/// and look for the service's own vocabulary in the reply.
+fn already_running() -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], BRIDGE_PORT));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let req = format!(
+        "GET /glide/tools HTTP/1.1\r\nHost: 127.0.0.1:{BRIDGE_PORT}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    let _ = stream.read_to_string(&mut reply);
+    reply.contains("\"tools\"")
 }
 
 pub fn run(daemon: Arc<Daemon>) -> Result<()> {
-    // The daemon (CDP + companion bridge) runs on a background tokio runtime;
-    // the platform event loop below needs the main thread.
+    // Single instance: if a Keel daemon is already serving the bridge,
+    // relaunching the app should give feedback, not a port clash. Open the
+    // companion app (the closest thing to "focusing" a tray-only app) and
+    // bow out; the original tray icon keeps running untouched.
+    if already_running() {
+        tracing::info!(
+            "Keel is already running on port {BRIDGE_PORT} — opening the companion app instead"
+        );
+        open_in_browser(&companion_url());
+        return Ok(());
+    }
+
+    // The daemon (companion bridge + silent browser attach) runs on a
+    // background tokio runtime; the platform event loop below needs the
+    // main thread.
     let runtime = tokio::runtime::Runtime::new()?;
     let daemon_bg = Arc::clone(&daemon);
     runtime.spawn(async move {
-        if let Err(e) = daemon_bg.ensure_connected().await {
-            tracing::warn!("browser not connected yet: {e}");
-        }
         if let Err(e) = crate::http::run(daemon_bg).await {
             tracing::error!("companion bridge stopped: {e:#}");
         }
     });
 
+    // `mut` is only used by the macOS activation-policy call below.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
@@ -70,27 +134,34 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
         let _ = proxy.send_event(UserEvent::Menu(event));
     }));
 
+    // Silent browser watcher: attach to a browser whose DevTools port is
+    // already answering — NEVER launch one — and keep the status line honest.
+    // Chrome only ever starts when a live-session tool call demands it.
+    let status_proxy = event_loop.create_proxy();
+    let daemon_poll = Arc::clone(&daemon);
+    runtime.spawn(async move {
+        let mut last: Option<bool> = None;
+        loop {
+            let connected = daemon_poll.attach_if_running().await;
+            if last != Some(connected) {
+                last = Some(connected);
+                let _ = status_proxy.send_event(UserEvent::BrowserStatus(connected));
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+
     let menu = Menu::new();
-    let status_item = MenuItem::new(
-        format!("Keel is running — bridge on 127.0.0.1:{BRIDGE_PORT}"),
-        false,
-        None,
-    );
+    let open_item = MenuItem::new("Open Keel", true, None);
+    menu.append(&open_item)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    let status_item = MenuItem::new("Status: Waiting for Chrome…", false, None);
     menu.append(&status_item)?;
-
-    let open_url = companion_url();
-    let open_item = open_url
-        .as_ref()
-        .map(|_| MenuItem::new("Open Keel", true, None));
-    if let Some(item) = &open_item {
-        menu.append(item)?;
-    }
-
     menu.append(&PredefinedMenuItem::separator())?;
     let quit_item = MenuItem::new("Quit Keel", true, None);
     menu.append(&quit_item)?;
 
-    let open_id = open_item.as_ref().map(|i| i.id().clone());
+    let open_id = open_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     // Created lazily inside the loop: on macOS the tray icon must be built
@@ -103,7 +174,7 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
             Event::NewEvents(StartCause::Init) => {
                 match TrayIconBuilder::new()
                     .with_menu(Box::new(menu.clone()))
-                    .with_tooltip("Keel — connected to your browser")
+                    .with_tooltip("Keel — waiting for Chrome")
                     .with_icon(keel_icon())
                     .build()
                 {
@@ -114,14 +185,23 @@ pub fn run(daemon: Arc<Daemon>) -> Result<()> {
                     }
                 }
             }
+            Event::UserEvent(UserEvent::BrowserStatus(connected)) => {
+                let (status, tooltip) = if connected {
+                    ("Status: Running", "Keel — connected to your browser")
+                } else {
+                    ("Status: Waiting for Chrome…", "Keel — waiting for Chrome")
+                };
+                status_item.set_text(status);
+                if let Some(t) = &tray {
+                    let _ = t.set_tooltip(Some(tooltip));
+                }
+            }
             Event::UserEvent(UserEvent::Menu(menu_event)) => {
                 if menu_event.id == quit_id {
                     tray.take(); // remove the icon before exiting
                     *control_flow = ControlFlow::Exit;
-                } else if Some(&menu_event.id) == open_id.as_ref() {
-                    if let Some(url) = &open_url {
-                        open_in_browser(url);
-                    }
+                } else if menu_event.id == open_id {
+                    open_in_browser(&companion_url());
                 }
             }
             _ => {}

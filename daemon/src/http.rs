@@ -37,7 +37,8 @@ pub async fn run(daemon: Arc<Daemon>) -> Result<()> {
 }
 
 async fn health(State(daemon): State<Arc<Daemon>>) -> Json<Value> {
-    let connected = daemon.ensure_connected().await.is_ok();
+    // Probe only — a health check must never launch Chrome as a side effect.
+    let connected = daemon.attach_if_running().await;
     Json(json!({
         "ok": true,
         "service": "keel-daemon",

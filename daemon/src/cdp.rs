@@ -51,6 +51,42 @@ impl Daemon {
         })
     }
 
+    /// Attach to a browser whose DevTools port is already answering — and
+    /// NEVER launch one. Returns whether a browser is connected afterwards.
+    ///
+    /// This is the polite probe the tray's status poller and the bridge's
+    /// health endpoint use: checking on Chrome must not have the side effect
+    /// of starting Chrome. Launching stays reserved for real tool calls
+    /// (`ensure_connected`, via `open_tab`).
+    pub async fn attach_if_running(self: &Arc<Self>) -> bool {
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(browser) = inner.browser.as_mut() {
+                if browser.version().await.is_ok() {
+                    return true;
+                }
+                // The browser we were attached to is gone — forget it so a
+                // fresh one can be adopted below (or launched later on demand).
+                inner.browser = None;
+                inner.tabs.clear();
+                inner.tab_order.clear();
+                inner.current_tab = None;
+            }
+        }
+
+        let Ok(ws_url) = debugger_ws_url(self.debug_port).await else {
+            return false;
+        };
+        let Ok((browser, mut handler)) = Browser::connect(ws_url).await else {
+            return false;
+        };
+        tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+        let mut inner = self.inner.lock().await;
+        inner.browser = Some(browser);
+        true
+    }
+
     /// Attach to a running browser with an open debug port, or start Chrome
     /// with the persistent Glide profile when nothing is listening yet.
     pub async fn ensure_connected(self: &Arc<Self>) -> Result<()> {
@@ -495,6 +531,10 @@ fn launch_chrome(port: u16) -> Result<()> {
             .arg(format!("--user-data-dir={profile_dir}"))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            // Launched on demand (a tool call needed a browser): come up
+            // quietly with no startup window stealing focus — the first
+            // visible window is the tab the tool opens.
+            .arg("--no-startup-window")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

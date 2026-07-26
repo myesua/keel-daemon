@@ -1,10 +1,25 @@
-# Keel v0 — Job Application Copilot
+# Keel v0.2: the "it's me again" copilot
 
-A no-build, Manifest V3 Chrome extension that proves Keel can work inside the user's real browser session. It reads the active page's live DOM, highlights every target before acting, fills known profile data, asks instead of guessing, and pauses at passwords, CAPTCHAs, and file uploads.
+Keel is a voice-first, screen-aware, human-in-the-loop browser copilot. Its job is the task the web makes you repeat forever: introducing yourself. Signups, checkouts, registrations, intake forms, and job applications all ask for the same person. Keel reads the page you are on, figures out which of those tasks it is, drafts every field from what it knows about you, and shows you everything for approval before anything touches the page. It never submits on its own.
+
+The engine is surface-agnostic. Job applications are the first surface built end to end (resume intake, tailored resumes, open-question answers), but the same profile and the same engine fill a checkout or a signup just as well.
+
+## What's in v0.2
+
+- **Chat-only interface.** One thread: type, talk, or drop a file. Plans, previews, questions, and the action timeline all live inline in the same conversation.
+- **Proactive intent detection.** On attach, Keel reads the active tab and guesses the task ("this looks like a checkout"). It follows your active tab as you switch, and you can correct it in one tap or one sentence; corrections are remembered per site.
+- **A relational profile, not a job-application form.** Identity, contact details, links, work summary, durable preferences, learned answers, and per-domain memory, all in `chrome.storage.local`. Every answer you approve or correct makes the next form faster, on any site.
+- **All field types.** Text, email, phone, dropdowns, radio groups, and checkboxes are recognized and filled. File inputs get your saved documents attached (with your approval). Passwords, CAPTCHAs, and one-time codes are always handed back to you.
+- **Preview everything.** Every value appears in a plan card with a per-field confidence dot (green, amber, red) and stays editable until you approve it. Submit-style buttons are only ever clicked with your explicit approval.
+- **One-tap undo.** Every fill batch gets an Undo button in the timeline that restores the previous values.
+- **Voice input built for reliability.** Continuous dictation with automatic restarts, a stall watchdog, and a transcript buffer that survives network hiccups.
+- **Job application module.** Upload your resume once (Keel learns your profile from it), share a job posting link or paste the description, ask for a tailored resume (honest rewording only, exported as a real PDF), and let Keel draft answers to open-ended questions in your voice.
+- **Walk-away mode.** Flip the toggle and Keel keeps working through what it is confident about, drafts the rest, and sends a desktop notification when it is done or needs you. It still never submits without approval.
+- **WebMCP progressive enhancement.** If the page exposes WebMCP tools, Keel detects them and prefers structured tool calls over raw DOM actuation. No WebMCP, no problem: the DOM engine is the default path.
 
 ## Load it in Chrome
 
-There is no build step, package install, API key, daemon, debug port, or connection step. The extension is plain JavaScript that Chrome loads straight from these files.
+There is no build step, package install, API key, daemon, debug port, or connection step. Chrome loads the extension straight from these files.
 
 ### 1. Get the files onto your computer
 
@@ -14,78 +29,69 @@ Either clone the repository:
 git clone https://github.com/myesua/keel-extension.git
 ```
 
-…or download the ZIP and unzip it. On the repository page click the green **Code** button, then **Download ZIP**.
+...or download the ZIP: on the repository page click the green **Code** button, then **Download ZIP**.
 
-**ZIP gotcha:** unzipping a GitHub download produces a wrapper folder named `keel-extension-main`. The folder you point Chrome at is the one that directly contains `manifest.json` — that is the unzipped `keel-extension-main` folder itself, not its parent and not a subfolder. If you double-click into a folder and see `manifest.json`, `content.js`, and `sidepanel.html` sitting there, you are in the right place.
+**ZIP gotcha:** unzipping a GitHub download produces a wrapper folder named `keel-extension-main`. The folder you point Chrome at is the one that directly contains `manifest.json` (that is the unzipped `keel-extension-main` folder itself, not its parent and not a subfolder). If you open a folder and see `manifest.json`, `content.js`, and `sidepanel.html` sitting there, you are in the right place.
 
 ### 2. Load it as an unpacked extension
 
-1. Open Chrome and go to `chrome://extensions` (type it into the address bar — it will not work as a link).
-2. Turn on **Developer mode** using the toggle in the **top-right corner**. The **Load unpacked** button only appears after this is on.
+1. Open Chrome and go to `chrome://extensions` (type it into the address bar).
+2. Turn on **Developer mode** with the toggle in the top-right corner.
 3. Click **Load unpacked** (top-left).
-4. In the folder picker, select the folder containing `manifest.json` and confirm. Select the *folder itself* — do not open it and select `manifest.json`.
-5. A **Keel — Job Application Copilot** card appears in the list. Requires Chrome 114 or newer.
-6. Optional but recommended: click the puzzle-piece **Extensions** icon in the toolbar and pin Keel so its icon is always visible.
+4. Select the folder containing `manifest.json` and confirm. Select the folder itself, not the file.
+5. A **Keel: Browser Copilot** card appears. Requires Chrome 114 or newer.
+6. Recommended: click the puzzle-piece Extensions icon in the toolbar and pin Keel.
 
 ### 3. Turn on file-URL access (needed for the bundled test form)
 
-Chrome blocks extensions from `file://` pages by default, so this step is required before you can test against the included `test-form.html`.
-
-1. Still on `chrome://extensions`, click **Details** on the Keel card.
-2. Scroll to **Allow access to file URLs** and switch it **on**.
+1. On `chrome://extensions`, click **Details** on the Keel card.
+2. Switch on **Allow access to file URLs**.
 
 ### 4. Open it
 
-Click the Keel toolbar icon on any normal page to open Chrome's side panel.
+Click the Keel toolbar icon on any normal page to open the side panel. The first time you use the mic, Chrome will ask for microphone permission.
 
-**Important:** a tab that was already open *before* you installed the extension has no content script in it. Refresh that tab (or open a new one) before starting a run, or Keel will not be able to see the page.
+**Important:** a tab that was already open before you installed the extension has no content script in it. Keel injects one automatically when it attaches, but if it reports it cannot see the page, refresh that tab once.
 
 ### Updating after a code change
 
-Pull or re-download the files, then return to `chrome://extensions` and click the circular **reload** arrow on the Keel card. Refresh any page you want to run on afterwards.
+Pull or re-download the files, then return to `chrome://extensions` and click the circular reload arrow on the Keel card. Refresh any page you want to run on afterwards.
 
 ## Fast, controlled test
 
-The included `test-form.html` exercises known fields, an ambiguous required question, checkbox/radio clicking, and the resume pause.
+The included `test-form.html` is a mock job application that exercises every field type, the password and file pauses, and a mock WebMCP tool surface.
 
-1. Confirm **Allow access to file URLs** is on (step 3 above). Without it Keel cannot see the test page.
-2. Open `test-form.html` directly in Chrome — drag the file into a Chrome window, or use **File → Open File**. The address bar will show a URL beginning with `file://`.
-3. Click Keel's toolbar icon to open the side panel.
-4. Enter at least first name, last name, email, phone, address, city, state, postal code, country, current company, title, and LinkedIn in **Your profile**. Profile changes are stored automatically in `chrome.storage.local`.
-5. Leave the instruction as **Apply to this job** and click **Start on this page**.
-6. Watch the page: Keel scrolls to and outlines every target before filling it.
-7. Answer the required sponsorship and referral questions in the side panel. Keel will click/select only the answer you gave.
-8. At **Resume**, choose a file manually on the page, then click **I've handled it — continue**.
-9. Review the result. Keel deliberately does not click **Submit application**.
+1. Confirm **Allow access to file URLs** is on.
+2. Open `test-form.html` in Chrome (drag the file into a window). The address bar shows a `file://` URL.
+3. Open Keel from the toolbar. It should announce that the page looks like a job application and that the page offers WebMCP tools.
+4. Teach it who you are, in chat: `my name is Ada Okoye`, `my email is ada@example.com`, or just upload a resume with the paperclip.
+5. Say **go ahead**. A plan card appears with every field previewed, confidence dots, and editable values. Radios, dropdowns, and checkboxes are included.
+6. Approve the plan. Watch the page: every target is highlighted before it is filled. Then try **undo**.
+7. Keel asks you to handle the password and (if you have not saved a resume) the file upload yourself, offers the final **Submit application** click for your approval, and otherwise leaves submission to you.
 
-For a real test, navigate to a job application form, refresh the tab if it was open before the extension was installed, open Keel, populate the profile, and start the same instruction.
+For a real test, open any signup, checkout, or job application, open Keel, and say **go ahead**.
 
-## What works in v0
+## How it is put together
 
-- Manifest V3 with `chrome.sidePanel`; operates in normal signed-in `http`, `https`, and permitted `file` tabs.
-- Reads visible `input`, `select`, and `textarea` controls in DOM order.
-- Maps common English labels, names, placeholders, ARIA labels, and `autocomplete` values to the local profile.
-- Highlights and labels a target before every fill or click.
-- Preserves existing answers.
-- Asks for ambiguous or missing values; required fields cannot be skipped.
-- Selects dropdown choices and clicks radio/checkbox controls only from explicit profile/user answers.
-- Pauses for password fields, file uploads, and detected CAPTCHAs.
-- Never solves CAPTCHAs, accesses files, types passwords, advances pages, or submits an application.
-- `profileMatch()` in `content.js` is the zero-key heuristic resolver. It is the seam where a future LLM-backed ambiguity resolver can be added without changing the execution/highlight loop.
+- `manifest.json` - MV3 permissions, side panel, service worker, both content scripts (isolated engine + main-world WebMCP bridge), icons
+- `service-worker.js` - opens the side panel from the toolbar icon
+- `sidepanel.html`, `sidepanel.css`, `sidepanel.js` - the chat thread, plan cards, composer, voice, uploads, walk-away mode
+- `lib/profile.js` - the relational profile and per-domain memory (chrome.storage.local)
+- `lib/voice.js` - the reliability-hardened speech input wrapper
+- `lib/jobkit.js` - the job application module: JD fetching, resume tailoring, open-question answers, and a dependency-free PDF writer
+- `lib/assist.js` - client for Keel's server-side language brain (an Audos workspace hook), with the no-em-dash text hygiene
+- `content.js` - DOM scanner, field registry, highlight overlay, apply/undo executor, WebMCP client, page-change watcher
+- `webmcp-bridge.js` - main-world probe that detects and calls page-exposed WebMCP tools
+- `test-form.html` - local manual acceptance fixture
+- `icons/` - extension and notification icons
+
+Keel ships with zero API keys. Generation tasks (intent refinement, drafting, tailored resumes, open-question answers, chat) call a workspace hook; when it is unreachable, Keel degrades to its local heuristics and simply asks you instead of guessing.
 
 ## Known limits
 
-- This pass handles the fields currently present in the top-level document. It does not automatically click **Next** on multi-step applications or rescan fields added later.
-- Cross-origin iframes, closed shadow roots, canvas-rendered controls, and browser-internal pages are not accessible.
-- Matching is intentionally conservative and English-first; unfamiliar fields trigger a question.
-- Exact dropdown matching is required after normalization. Keel re-asks rather than choosing a near match.
-- CAPTCHA detection is best-effort; Keel never attempts to bypass one.
-- Broad page access is included for this unpacked proof-of-concept. A production release should narrow permissions and add an explicit site-access onboarding flow.
-
-## Files
-
-- `manifest.json` — MV3 permissions, side panel, service worker, and content script registration
-- `service-worker.js` — opens the side panel from the extension action
-- `sidepanel.html`, `sidepanel.css`, `sidepanel.js` — instruction/chat UI and local profile memory
-- `content.js` — DOM scanner, heuristic resolver, highlight overlay, executor, and human-turn pauses
-- `test-form.html` — local manual acceptance fixture
+- Cross-origin iframes, closed shadow roots, and canvas-rendered controls are not reachable; Keel tells you when it cannot see a form.
+- Multi-step forms are supported via the page-change watcher and rescan, but Keel does not click "Next" style buttons without your approval.
+- Resume text extraction happens for text files (.txt, .md). For PDFs, Keel keeps the file for uploads and asks you to paste the text once so it can learn from it.
+- Voice uses Chrome's speech service and needs an internet connection.
+- CAPTCHA detection is best effort, and Keel never attempts to solve one.
+- Broad host permissions are included for this unpacked proof of concept. A production release should narrow permissions and add a site-access onboarding flow.

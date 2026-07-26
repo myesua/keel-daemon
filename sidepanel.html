@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Keel</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="mark" aria-hidden="true">K</div>
+      <div>
+        <h1>Keel</h1>
+        <p>Job application copilot</p>
+      </div>
+      <span id="status" class="status">Ready</span>
+    </header>
+
+    <main>
+      <section class="card intent-card" aria-labelledby="intent-title">
+        <div class="eyebrow">Instruction</div>
+        <h2 id="intent-title">What should Keel do?</h2>
+        <textarea id="intent" rows="3" placeholder="Apply to this job"></textarea>
+        <button id="run" class="primary" type="button">Start on this page</button>
+        <p class="hint">Keel highlights every target first and never submits the application.</p>
+      </section>
+
+      <section class="card" aria-labelledby="conversation-title">
+        <div class="section-heading">
+          <div>
+            <div class="eyebrow">Live activity</div>
+            <h2 id="conversation-title">Conversation</h2>
+          </div>
+          <button id="clear-chat" class="text-button" type="button">Clear</button>
+        </div>
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <div id="human-turn" class="human-turn" hidden>
+          <div class="turn-label">Your turn</div>
+          <strong id="turn-title"></strong>
+          <p id="turn-detail"></p>
+          <input id="turn-answer" type="text" autocomplete="off" />
+          <datalist id="turn-options"></datalist>
+          <div class="turn-actions">
+            <button id="answer" class="primary" type="button">Use this answer</button>
+            <button id="continue" class="primary" type="button" hidden>I've handled it — continue</button>
+            <button id="skip" class="secondary" type="button" hidden>Skip optional field</button>
+          </div>
+        </div>
+      </section>
+
+      <details class="card profile-card" open>
+        <summary>
+          <span>
+            <span class="eyebrow">Memory</span>
+            <strong>Your profile</strong>
+          </span>
+          <span id="save-state">Saved locally</span>
+        </summary>
+        <form id="profile-form">
+          <div class="grid two">
+            <label>First name<input name="firstName" autocomplete="given-name" /></label>
+            <label>Last name<input name="lastName" autocomplete="family-name" /></label>
+          </div>
+          <label>Full name<input name="fullName" autocomplete="name" /></label>
+          <label>Email<input name="email" type="email" autocomplete="email" /></label>
+          <label>Phone<input name="phone" type="tel" autocomplete="tel" /></label>
+          <label>Street address<input name="addressLine1" autocomplete="address-line1" /></label>
+          <label>Address line 2<input name="addressLine2" autocomplete="address-line2" /></label>
+          <div class="grid two">
+            <label>City<input name="city" autocomplete="address-level2" /></label>
+            <label>State / region<input name="state" autocomplete="address-level1" /></label>
+            <label>Postal code<input name="postalCode" autocomplete="postal-code" /></label>
+            <label>Country<input name="country" autocomplete="country-name" /></label>
+          </div>
+          <label>Current company<input name="currentCompany" /></label>
+          <label>Current title<input name="currentTitle" /></label>
+          <label>LinkedIn URL<input name="linkedin" type="url" /></label>
+          <label>GitHub URL<input name="github" type="url" /></label>
+          <label>Portfolio URL<input name="portfolio" type="url" /></label>
+          <label>Work history / experience summary<textarea name="workHistory" rows="5"></textarea></label>
+          <button class="secondary save-button" type="submit">Save profile</button>
+        </form>
+      </details>
+    </main>
+
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

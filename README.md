@@ -1,97 +1,91 @@
-# Keel v0.3: the "it's me again" copilot
+# Keel v0.4: the copilot that is actually looking at your screen
 
-Keel is a voice-first, screen-aware, human-in-the-loop browser copilot. Its job is the task the web makes you repeat forever: introducing yourself. Signups, checkouts, registrations, intake forms, and job applications all ask for the same person. Keel reads the page you are on, figures out which of those tasks it is, drafts every field from what it knows about you, and shows you everything for approval before anything touches the page. It never submits on its own.
+Keel is a screen aware, human in the loop browser copilot. You talk to it, it reads the page you are on, and it does the browser work while you watch and approve. Its beachhead is the task the web makes you repeat forever: introducing yourself. Signups, checkouts, registrations, intake forms, and job applications all ask for the same person.
 
-The engine is surface-agnostic. Job applications are the first surface built end to end (resume intake, tailored resumes, open-question answers), but the same profile and the same engine fill a checkout or a signup just as well.
+## What changed in v0.4, and why
 
-## What's in v0.3
+The v0.3 side panel had a hardcoded question script: ask for the resume, ask for the job description, ask permission to start, then fill. That script ran no matter what was on the page and no matter what you had already said, which is why it re-asked answered questions, ignored "yes", and drifted to whatever empty box it found. It also never looked at the page while it talked to you.
 
-- **Stateful LLM conversation controller.** One thread tracks resume intake, job-description intake, drafted answers, approval, and the current phase as explicit session slots. Every turn is interpreted by the language model, then checked against authoritative state before Keel asks or acts. Repeated inputs are idempotent, natural affirmations advance the work, and missing items are requested once in one consolidated question.
-- **Proactive intent detection.** On attach, Keel reads the active tab and guesses the task ("this looks like a checkout"). It follows your active tab as you switch, and you can correct it in one tap or one sentence; corrections are remembered per site.
-- **A relational profile, not a job-application form.** Identity, contact details, links, work summary, durable preferences, learned answers, and per-domain memory, all in `chrome.storage.local`. Every answer you approve or correct makes the next form faster, on any site.
-- **All field types.** Text, email, phone, dropdowns, radio groups, and checkboxes are recognized and filled. File inputs get your saved documents attached (with your approval). Passwords, CAPTCHAs, and one-time codes are always handed back to you.
-- **Preview everything.** Every value appears in a plan card with a per-field confidence dot (green, amber, red) and stays editable until you approve it. Submit-style buttons are only ever clicked with your explicit approval.
-- **One-tap undo.** Every fill batch gets an Undo button in the timeline that restores the previous values.
-- **Voice input built for reliability.** Continuous dictation with automatic restarts, a stall watchdog, and a transcript buffer that survives network hiccups.
-- **Job application module.** Upload a PDF, DOCX, or TXT resume once. PDFs are processed by the workspace's native document-analysis service, DOCX text is extracted in Chrome, and TXT is read directly. Keel proves the parse with factual name, recent-role, and skill details, saves the parsed text to the reusable profile, accepts a job-posting link or pasted description, drafts open-ended answers, and can export an honestly tailored resume as a real PDF.
-- **Walk-away mode.** Flip the toggle and Keel keeps working through what it is confident about, drafts the rest, and sends a desktop notification when it is done or needs you. It still never submits without approval.
-- **WebMCP progressive enhancement.** If the page exposes WebMCP tools, Keel detects them and prefers structured tool calls over raw DOM actuation. No WebMCP, no problem: the DOM engine is the default path.
+v0.4 deletes the script. Two things replace it.
+
+**1. Perception on every turn.** Before Keel says anything, it re-reads the active tab and captures the viewport:
+
+- The content script returns the live DOM: every visible, interactable field in document order with its label, role, options, current value, required flag, the section heading above it, which form it belongs to, whether it is on screen right now, and where it sits on the page. Forms are classified (job application, checkout, login, newsletter signup, search, cookie notice) and the one your viewport is on is marked.
+- The service worker captures the visible tab with `chrome.tabs.captureVisibleTab` and the panel sends that image to the model inline with the DOM state. The screenshot is never uploaded to storage.
+- Keel follows your active tab and your scroll position. Switch tabs and it re-reads the new one.
+- Ask it what it can see and you get the real page: title, the section you are on, the fields actually in front of you, and the other forms it is deliberately ignoring. If a capture fails it says so instead of pretending.
+
+**2. A model that decides, not a script.** Each turn the model gets the live page, the conversation, and everything Keel already knows about you, and it chooses one next step. There is no fixed sequence of questions. Guard rails sit around that decision, in code:
+
+- A question that is already answered, in memory or earlier in the conversation, never reaches you. The model gets told it repeated itself and has to choose a real action instead.
+- If you have just said yes, a second permission question is blocked outright.
+- Fills are dropped unless they point at a field that exists, in the form you are on. Newsletter, search, and footer boxes are excluded by default.
+- Passwords and one time codes are never typed by Keel.
+- Everything is filled in real DOM order, top to bottom.
+- Nothing is filled until you approve the preview, and nothing is submitted until you click the submit button in the review card.
+
+Values are written by a second, focused pass over every empty field in the form you are on, which is what stops Keel filling the top of a form and abandoning the bottom.
+
+## Other things it does
+
+- **Memory that lasts.** Whatever you say once is stored in `chrome.storage.local` and reused this session, next session, and on other sites. The relational profile holds identity, contact details, links, work summary, learned answers, and per domain memory.
+- **All field types.** Text, email, phone, URL, dropdowns, radio groups, checkboxes, and textareas. Open ended questions are drafted from your resume and the job description, in your voice, editable before anything lands.
+- **Resume intake.** Upload a PDF, DOCX, or TXT once. PDFs go through the workspace document service, DOCX is unzipped and parsed in Chrome, TXT is read directly. Keel proves the parse with facts it actually read, and says exactly why if a file fails.
+- **One tap undo** for every fill batch.
+- **Voice input** with continuous dictation, automatic restarts, and a stall watchdog.
+- **Walk away mode** with a desktop notification when Keel needs you.
+- **A screen toggle.** Turn capture off and Keel works from the DOM alone and tells you that is what it is doing.
+- **WebMCP progressive enhancement.** If a page exposes WebMCP tools, Keel detects them and can prefer structured tool calls over DOM actuation.
 
 ## Load it in Chrome
 
-There is no build step, package install, API key, daemon, debug port, or connection step. Chrome loads the extension straight from these files.
+No build step, no package install, no API key, no daemon.
 
-### 1. Get the files onto your computer
+1. Clone or download this repository.
+2. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and select the folder that directly contains `manifest.json`. Chrome 114 or newer.
+3. On the Keel card click **Details** and switch on **Allow access to file URLs** if you want to use the bundled `test-form.html`.
+4. Click the Keel toolbar icon on any page to open the side panel.
 
-Either clone the repository:
-
-```bash
-git clone https://github.com/myesua/keel-extension.git
-```
-
-...or download the ZIP: on the repository page click the green **Code** button, then **Download ZIP**.
-
-**ZIP gotcha:** unzipping a GitHub download produces a wrapper folder named `keel-extension-main`. The folder you point Chrome at is the one that directly contains `manifest.json` (that is the unzipped `keel-extension-main` folder itself, not its parent and not a subfolder). If you open a folder and see `manifest.json`, `content.js`, and `sidepanel.html` sitting there, you are in the right place.
-
-### 2. Load it as an unpacked extension
-
-1. Open Chrome and go to `chrome://extensions` (type it into the address bar).
-2. Turn on **Developer mode** with the toggle in the top-right corner.
-3. Click **Load unpacked** (top-left).
-4. Select the folder containing `manifest.json` and confirm. Select the folder itself, not the file.
-5. A **Keel: Browser Copilot** card appears. Requires Chrome 114 or newer.
-6. Recommended: click the puzzle-piece Extensions icon in the toolbar and pin Keel.
-
-### 3. Turn on file-URL access (needed for the bundled test form)
-
-1. On `chrome://extensions`, click **Details** on the Keel card.
-2. Switch on **Allow access to file URLs**.
-
-### 4. Open it
-
-Click the Keel toolbar icon on any normal page to open the side panel. The first time you use the mic, Chrome will ask for microphone permission.
-
-**Important:** a tab that was already open before you installed the extension has no content script in it. Keel injects one automatically when it attaches, but if it reports it cannot see the page, refresh that tab once.
-
-### Updating after a code change
-
-Pull or re-download the files, then return to `chrome://extensions` and click the circular reload arrow on the Keel card. Refresh any page you want to run on afterwards.
+A tab that was already open before you installed the extension has no content script in it. Keel injects one when it attaches, and tells you to refresh if it cannot.
 
 ## Fast, controlled test
 
-The included `test-form.html` is a mock job application that exercises every field type, the password and file pauses, and a mock WebMCP tool surface.
+`test-form.html` is a mock job application that exercises every field type and includes two decoys on purpose: a search box in the header and a newsletter signup in the footer. Keel should work the application form and leave both decoys alone.
 
-1. Confirm **Allow access to file URLs** is on.
-2. Open `test-form.html` in Chrome (drag the file into a window). The address bar shows a `file://` URL.
-3. Open Keel from the toolbar. It should announce that the page looks like a job application and that the page offers WebMCP tools.
-4. Upload a PDF, DOCX, or TXT resume with the paperclip. Keel must echo factual details it read. Paste the job description or share its URL once.
-5. When Keel says it has both items, answer **yes** once. It must advance immediately to a plan card without repeating the question or asking for the job description again. Every field is previewed with confidence dots and editable values, including radios, dropdowns, and checkboxes.
-6. Approve the plan. Watch the page: every target is highlighted before it is filled. Then try **undo**.
-7. Keel asks you to handle the password and (if you have not saved a resume) the file upload yourself, offers the final **Submit application** click for your approval, and otherwise leaves submission to you.
-
-For a real test, open any signup, checkout, or job application, open Keel, and say **go ahead**.
+1. Open `test-form.html` in Chrome and open Keel.
+2. Ask **can you see my screen?** You should get your actual page back: title, the section you are on, and the real field names.
+3. Paste the job description once. Tell it who you are. Say **yes** once.
+4. A preview card appears with every value in page order. Edit or untick anything, then approve.
+5. Watch the page fill top to bottom, then check the review card. The password is left to you, the newsletter box is untouched, and nothing is submitted until you click the submit button in that card.
 
 ## How it is put together
 
-- `manifest.json` - MV3 permissions, side panel, service worker, both content scripts (isolated engine + main-world WebMCP bridge), icons
-- `service-worker.js` - opens the side panel from the toolbar icon
-- `sidepanel.html`, `sidepanel.css`, `sidepanel.js` - the chat thread, plan cards, composer, voice, uploads, walk-away mode
-- `lib/profile.js` - the relational profile and per-domain memory (chrome.storage.local)
-- `lib/voice.js` - the reliability-hardened speech input wrapper
-- `lib/jobkit.js` - the job application module: JD fetching, resume tailoring, open-question answers, and a dependency-free PDF writer
-- `lib/assist.js` - client for Keel's server-side language brain (an Audos workspace hook), with the no-em-dash text hygiene
-- `content.js` - DOM scanner, field registry, highlight overlay, apply/undo executor, WebMCP client, page-change watcher
-- `webmcp-bridge.js` - main-world probe that detects and calls page-exposed WebMCP tools
-- `test-form.html` - local manual acceptance fixture
-- `icons/` - extension and notification icons
+- `manifest.json` - MV3 permissions (`<all_urls>` is required for viewport capture), side panel, service worker, both content scripts
+- `service-worker.js` - opens the side panel, captures the visible tab
+- `sidepanel.html`, `sidepanel.css`, `sidepanel.js` - the thread, the "what Keel can see" strip, preview and review cards, composer, voice, uploads
+- `lib/perception.js` - active tab resolution, DOM read, viewport capture, the page view the model receives
+- `lib/agent.js` - the system prompt, the reasoning call, the drafting call, and the guards
+- `lib/memory.js` - facts, questions, transcript, and the already-answered check
+- `lib/profile.js` - the relational profile and per domain memory
+- `lib/docs.js` - PDF, DOCX, and TXT intake
+- `lib/jobkit.js` - job posting fetch, resume tailoring, dependency free PDF writer
+- `lib/voice.js` - speech input
+- `content.js` - DOM scanner with geometry, highlight overlay, apply and undo executor, WebMCP client, change watcher
+- `webmcp-bridge.js` - main world probe for page exposed WebMCP tools
+- `server/keel-assist.hook.js` - the workspace hook that backs the fallback brain, mirrored here for review
+- `test-form.html` - local acceptance fixture
 
-Keel ships with zero API keys. Generation tasks (intent refinement, drafting, tailored resumes, open-question answers, chat) call a workspace hook; when it is unreachable, Keel degrades to its local heuristics and simply asks you instead of guessing.
+Keel ships with zero API keys. Model calls go to the workspace endpoints, which hold the keys server side. If they are unreachable, Keel degrades to describing the page from the DOM and asking you rather than guessing.
+
+## Privacy
+
+The viewport screenshot goes from Chrome straight to the model as an inline image for that one request. It is not uploaded to storage, not written to disk, and not kept after the turn. Turn the **Screen** toggle off and no capture happens at all. Uploaded resumes are the exception: a PDF is sent to the workspace document service to be read, which is the only way to extract its text.
 
 ## Known limits
 
-- Cross-origin iframes, closed shadow roots, and canvas-rendered controls are not reachable; Keel tells you when it cannot see a form.
-- Multi-step forms are supported via the page-change watcher and rescan, but Keel does not click "Next" style buttons without your approval.
-- Resume intake supports standard PDF, DOCX, and TXT files up to 32 MB. Image-only or damaged PDFs may need to be exported as searchable PDF, DOCX, or TXT; Keel reports the exact parsing failure and never claims it read a file that failed.
-- Voice uses Chrome's speech service and needs an internet connection.
+- Cross origin iframes, closed shadow roots, and canvas rendered controls are not reachable. Keel says when it cannot see a form.
+- Multi step forms work through the change watcher and a fresh read each turn, but Keel does not click Next without approval.
+- Image only PDFs need to be exported as searchable PDF, DOCX, or TXT.
+- Voice uses Chrome's speech service and needs a connection.
 - CAPTCHA detection is best effort, and Keel never attempts to solve one.
-- Broad host permissions are included for this unpacked proof of concept. A production release should narrow permissions and add a site-access onboarding flow.
+- Broad host permissions are included for this unpacked proof of concept. A production release should add a site access onboarding flow.

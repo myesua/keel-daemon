@@ -11,13 +11,22 @@
       <div class="mark" aria-hidden="true">K</div>
       <div class="title-block">
         <h1>Keel</h1>
-        <p id="context-line">Looking at this page</p>
+        <p id="context-line">Looking for your page</p>
       </div>
       <label class="walkaway" title="Keep working while you step away, then notify you">
         <input id="walkaway-toggle" type="checkbox" />
         <span>Walk away</span>
       </label>
     </header>
+
+    <section id="vision" class="vision" aria-label="What Keel can see">
+      <img id="vision-shot" class="vision-shot" alt="Latest capture of your tab" hidden />
+      <div class="vision-text">
+        <strong id="vision-title">Not reading anything yet</strong>
+        <span id="vision-detail">Open the page you want help with.</span>
+      </div>
+      <button id="vision-toggle" class="vision-toggle" type="button" title="Turn screen capture on or off">Screen: on</button>
+    </section>
 
     <main>
       <div id="thread" class="thread" aria-live="polite"></div>

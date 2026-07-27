@@ -5,23 +5,40 @@
   <title>Careers at Acme: Apply for Senior Engineer</title>
   <meta name="description" content="Apply to join Acme as a Senior Engineer." />
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; color: #222; }
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto 0; padding: 0 16px 40px; color: #222; }
+    header.site { display: flex; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid #eee; }
+    header.site form { margin-left: auto; display: flex; gap: 6px; }
     fieldset { margin: 18px 0; padding: 14px; border: 1px solid #ccc; border-radius: 8px; }
     legend { font-weight: 700; }
     label { display: block; margin: 10px 0 4px; font-size: 14px; }
-    input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="password"], select, textarea {
+    input[type="text"], input[type="email"], input[type="tel"], input[type="url"], input[type="password"], input[type="search"], select, textarea {
       width: 100%; padding: 8px; border: 1px solid #bbb; border-radius: 6px; font: inherit; box-sizing: border-box;
     }
+    header.site input { width: 180px; }
     .inline label { display: inline-flex; gap: 6px; align-items: center; margin-right: 16px; font-weight: 400; }
     button { margin-top: 18px; padding: 10px 18px; border: 0; border-radius: 8px; background: #0d7355; color: white; font-weight: 700; cursor: pointer; }
+    header.site button, footer.site button { margin-top: 0; padding: 8px 12px; }
     .note { color: #777; font-size: 12px; }
+    footer.site { margin-top: 520px; padding: 24px; background: #f3f5f4; border-radius: 10px; }
+    footer.site form { display: flex; gap: 8px; align-items: center; }
+    #submitted-banner { display: none; margin: 16px 0; padding: 10px; border-radius: 8px; background: #e8f4ef; color: #0d7355; font-weight: 700; }
   </style>
 </head>
 <body>
-  <h1>Apply for Senior Engineer</h1>
-  <p class="note">Local acceptance fixture for Keel. It exercises text inputs, dropdowns, radio groups, checkboxes, a textarea question, a password, a file upload, and a mock WebMCP tool surface. Keel should preview everything, fill only approved values, and never click Submit application on its own.</p>
+  <header class="site">
+    <strong>Acme</strong>
+    <form role="search">
+      <label for="site-search" class="visually-hidden">Search the site</label>
+      <input id="site-search" name="q" type="search" placeholder="Search jobs" />
+      <button type="button">Search</button>
+    </form>
+  </header>
 
-  <form>
+  <h1>Apply for Senior Engineer</h1>
+  <p class="note">Local acceptance fixture for Keel. It exercises text inputs, dropdowns, radio groups, checkboxes, a textarea question, a password, a file upload, a mock WebMCP surface, and two decoys: a search box at the top and a newsletter box at the bottom. Keel should work the application form, preview everything, and never click Submit application on its own.</p>
+  <div id="submitted-banner">The fixture form was submitted.</div>
+
+  <form id="application">
     <fieldset>
       <legend>About you</legend>
       <label for="first">First name *</label>
@@ -97,6 +114,16 @@
     <button type="submit">Submit application</button>
   </form>
 
+  <footer class="site">
+    <h3>Subscribe to our newsletter</h3>
+    <p class="note">Monthly notes about open roles at Acme.</p>
+    <form id="newsletter">
+      <label for="newsletter-email" class="visually-hidden">Your email</label>
+      <input id="newsletter-email" name="newsletter_email" type="email" placeholder="you@example.com" />
+      <button type="button">Subscribe</button>
+    </form>
+  </footer>
+
   <script>
     // Mock WebMCP surface so developers can watch Keel's progressive
     // enhancement kick in ("this page offers WebMCP tools").
@@ -114,9 +141,13 @@
         return { content: [{ type: "text", text: `set ${args.name}` }] };
       }
     };
-    document.querySelector("form").addEventListener("submit", (event) => {
+    // A submit flag instead of an alert, so automated acceptance runs can check
+    // that Keel never submitted anything on its own.
+    window.__keelFixtureSubmitted = false;
+    document.querySelector("#application").addEventListener("submit", (event) => {
       event.preventDefault();
-      alert("Submitted (fixture only).");
+      window.__keelFixtureSubmitted = true;
+      document.querySelector("#submitted-banner").style.display = "block";
     });
   </script>
 </body>

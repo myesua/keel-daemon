@@ -1,19 +1,19 @@
-# Keel v0.2: the "it's me again" copilot
+# Keel v0.3: the "it's me again" copilot
 
 Keel is a voice-first, screen-aware, human-in-the-loop browser copilot. Its job is the task the web makes you repeat forever: introducing yourself. Signups, checkouts, registrations, intake forms, and job applications all ask for the same person. Keel reads the page you are on, figures out which of those tasks it is, drafts every field from what it knows about you, and shows you everything for approval before anything touches the page. It never submits on its own.
 
 The engine is surface-agnostic. Job applications are the first surface built end to end (resume intake, tailored resumes, open-question answers), but the same profile and the same engine fill a checkout or a signup just as well.
 
-## What's in v0.2
+## What's in v0.3
 
-- **Chat-only interface.** One thread: type, talk, or drop a file. Plans, previews, questions, and the action timeline all live inline in the same conversation.
+- **Stateful LLM conversation controller.** One thread tracks resume intake, job-description intake, drafted answers, approval, and the current phase as explicit session slots. Every turn is interpreted by the language model, then checked against authoritative state before Keel asks or acts. Repeated inputs are idempotent, natural affirmations advance the work, and missing items are requested once in one consolidated question.
 - **Proactive intent detection.** On attach, Keel reads the active tab and guesses the task ("this looks like a checkout"). It follows your active tab as you switch, and you can correct it in one tap or one sentence; corrections are remembered per site.
 - **A relational profile, not a job-application form.** Identity, contact details, links, work summary, durable preferences, learned answers, and per-domain memory, all in `chrome.storage.local`. Every answer you approve or correct makes the next form faster, on any site.
 - **All field types.** Text, email, phone, dropdowns, radio groups, and checkboxes are recognized and filled. File inputs get your saved documents attached (with your approval). Passwords, CAPTCHAs, and one-time codes are always handed back to you.
 - **Preview everything.** Every value appears in a plan card with a per-field confidence dot (green, amber, red) and stays editable until you approve it. Submit-style buttons are only ever clicked with your explicit approval.
 - **One-tap undo.** Every fill batch gets an Undo button in the timeline that restores the previous values.
 - **Voice input built for reliability.** Continuous dictation with automatic restarts, a stall watchdog, and a transcript buffer that survives network hiccups.
-- **Job application module.** Upload your resume once (Keel learns your profile from it), share a job posting link or paste the description, ask for a tailored resume (honest rewording only, exported as a real PDF), and let Keel draft answers to open-ended questions in your voice.
+- **Job application module.** Upload a PDF, DOCX, or TXT resume once. PDFs are processed by the workspace's native document-analysis service, DOCX text is extracted in Chrome, and TXT is read directly. Keel proves the parse with factual name, recent-role, and skill details, saves the parsed text to the reusable profile, accepts a job-posting link or pasted description, drafts open-ended answers, and can export an honestly tailored resume as a real PDF.
 - **Walk-away mode.** Flip the toggle and Keel keeps working through what it is confident about, drafts the rest, and sends a desktop notification when it is done or needs you. It still never submits without approval.
 - **WebMCP progressive enhancement.** If the page exposes WebMCP tools, Keel detects them and prefers structured tool calls over raw DOM actuation. No WebMCP, no problem: the DOM engine is the default path.
 
@@ -64,8 +64,8 @@ The included `test-form.html` is a mock job application that exercises every fie
 1. Confirm **Allow access to file URLs** is on.
 2. Open `test-form.html` in Chrome (drag the file into a window). The address bar shows a `file://` URL.
 3. Open Keel from the toolbar. It should announce that the page looks like a job application and that the page offers WebMCP tools.
-4. Teach it who you are, in chat: `my name is Ada Okoye`, `my email is ada@example.com`, or just upload a resume with the paperclip.
-5. Say **go ahead**. A plan card appears with every field previewed, confidence dots, and editable values. Radios, dropdowns, and checkboxes are included.
+4. Upload a PDF, DOCX, or TXT resume with the paperclip. Keel must echo factual details it read. Paste the job description or share its URL once.
+5. When Keel says it has both items, answer **yes** once. It must advance immediately to a plan card without repeating the question or asking for the job description again. Every field is previewed with confidence dots and editable values, including radios, dropdowns, and checkboxes.
 6. Approve the plan. Watch the page: every target is highlighted before it is filled. Then try **undo**.
 7. Keel asks you to handle the password and (if you have not saved a resume) the file upload yourself, offers the final **Submit application** click for your approval, and otherwise leaves submission to you.
 
@@ -91,7 +91,7 @@ Keel ships with zero API keys. Generation tasks (intent refinement, drafting, ta
 
 - Cross-origin iframes, closed shadow roots, and canvas-rendered controls are not reachable; Keel tells you when it cannot see a form.
 - Multi-step forms are supported via the page-change watcher and rescan, but Keel does not click "Next" style buttons without your approval.
-- Resume text extraction happens for text files (.txt, .md). For PDFs, Keel keeps the file for uploads and asks you to paste the text once so it can learn from it.
+- Resume intake supports standard PDF, DOCX, and TXT files up to 32 MB. Image-only or damaged PDFs may need to be exported as searchable PDF, DOCX, or TXT; Keel reports the exact parsing failure and never claims it read a file that failed.
 - Voice uses Chrome's speech service and needs an internet connection.
 - CAPTCHA detection is best effort, and Keel never attempts to solve one.
 - Broad host permissions are included for this unpacked proof of concept. A production release should narrow permissions and add a site-access onboarding flow.

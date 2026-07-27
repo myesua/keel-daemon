@@ -1,1263 +1,1004 @@
-// Keel side panel: a single-thread, voice-first chat that drives the engine.
-// The panel is the brain; the content script is the hands and eyes.
 import { assist, humanizeText, parseLooseJson } from "./lib/assist.js";
 import {
-  loadProfile, saveProfile, flatProfile, setProfileValue, rememberAnswer,
-  lookupAnswer, profileSummaryText, PROFILE_FIELD_LABELS,
-  loadDocuments, saveDocument, getDocument
+  loadProfile,
+  saveProfile,
+  flatProfile,
+  setProfileValue,
+  rememberAnswer,
+  lookupAnswer,
+  profileSummaryText,
+  loadDocuments,
+  saveDocument
 } from "./lib/profile.js";
 import { VoiceInput } from "./lib/voice.js";
-import { fetchJobDescription, tailorResume, answerOpenQuestion, makeResumePdfBase64 } from "./lib/jobkit.js";
+import {
+  fetchJobDescription,
+  answerOpenQuestion,
+  tailorResume,
+  makeResumePdfBase64
+} from "./lib/jobkit.js";
 
-// ---------------------------------------------------------------------------
-// DOM references
-// ---------------------------------------------------------------------------
+const SESSION_KEY = "keelConversationV3";
+const WALKAWAY_KEY = "keelWalkawayV1";
+const APP_ID = "workspace-387488";
+const API_ORIGIN = "https://audos.com";
+const MAX_HISTORY = 60;
+
 const thread = document.querySelector("#thread");
 const contextLine = document.querySelector("#context-line");
-const composerInput = document.querySelector("#composer-input");
+const composer = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#send-button");
-const micButton = document.querySelector("#mic-button");
 const attachButton = document.querySelector("#attach-button");
 const fileInput = document.querySelector("#file-input");
+const micButton = document.querySelector("#mic-button");
 const voiceHint = document.querySelector("#voice-hint");
 const walkawayToggle = document.querySelector("#walkaway-toggle");
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
-let profile = null;
-let documents = {};
-let currentTab = null;           // { id, url, host, title }
-let session = null;              // per-page working state
-let walkAway = false;
-let attachSequence = 0;          // guards stale async work after tab switches
-let threadLog = [];              // persisted plain entries
+fileInput.accept = ".pdf,.docx,.txt,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
-const INTENT_LABELS = {
-  job_application: "a job application",
-  signup: "a signup form",
-  login: "a login form",
-  checkout: "a checkout",
-  booking: "a booking form",
-  contact: "a contact form",
-  survey: "a survey or intake form",
-  subscription: "a newsletter signup",
-  profile_update: "an account or profile form",
-  form: "a form",
-  none: "a page without a form"
-};
+let profile;
+let documents;
+let activeTabId = null;
+let snapshot = null;
+let currentPlan = null;
+let busy = false;
 
-function newSession() {
+function freshSession() {
   return {
-    snapshot: null,
-    intent: null,          // { kind, confidence, source }
-    plan: null,            // array of plan rows
-    planCard: null,
-    fills: 0,
-    jobDescription: null,
-    proposedOnce: false,
-    submitOffered: false
+    version: 3,
+    phase: "discovering",
+    intent: null,
+    resume: { uploaded: false, parsed: false, fileName: null, summary: null, text: null, error: null },
+    jobDescription: { provided: false, source: null, text: null, title: null },
+    openQuestionsDrafted: false,
+    approvalToProceed: false,
+    lastQuestionKey: null,
+    processedInputs: [],
+    history: [],
+    page: null,
+    updatedAt: null
   };
 }
 
-// ---------------------------------------------------------------------------
-// Thread rendering
-// ---------------------------------------------------------------------------
-function scrollToEnd() {
+let session = freshSession();
+
+function cleanText(value) {
+  return humanizeText(String(value || "")).replace(/\s+$/g, "");
+}
+
+function inputKey(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 500);
+}
+
+function isAffirmative(text) {
+  const value = inputKey(text);
+  return /^(yes|yeah|yep|yup|sure|ok|okay|go ahead|start|start now|do it|please do|move on|continue|proceed|fill it|fill the form|ready)( please)?$/.test(value)
+    || /\b(go ahead|start now|do it|move on|stop asking and start|fill (it|the form)|proceed now)\b/.test(value);
+}
+
+function isNegative(text) {
+  return /^(no|nope|not yet|wait|stop|cancel)$/i.test(String(text || "").trim());
+}
+
+function looksLikeJobDescription(text) {
+  const value = String(text || "").trim();
+  return value.length > 350 || /\b(job description|responsibilities|qualifications|requirements|about the role|what you will do)\b/i.test(value);
+}
+
+function looksLikeUrl(text) {
+  try {
+    const url = new URL(String(text || "").trim());
+    return ["http:", "https:"].includes(url.protocol);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function persistSession() {
+  session.updatedAt = new Date().toISOString();
+  await chrome.storage.local.set({ [SESSION_KEY]: session });
+}
+
+function scrollThread() {
   requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
 }
 
-function persistThread() {
-  chrome.storage.local.set({ keelThread: threadLog.slice(-120) }).catch(() => {});
+function recordMessage(role, text) {
+  session.history.push({ role, text: cleanText(text), at: new Date().toISOString() });
+  if (session.history.length > MAX_HISTORY) session.history = session.history.slice(-MAX_HISTORY);
 }
 
-function addMsg(text, tone = "keel", { persist = true } = {}) {
-  const clean = humanizeText(text);
+function addMessage(text, role = "keel", kind = "") {
+  const value = cleanText(text);
+  if (!value) return null;
   const node = document.createElement("div");
-  node.className = `msg ${tone}`;
-  node.textContent = clean;
+  node.className = `msg ${role} ${kind}`.trim();
+  node.textContent = value;
   thread.append(node);
-  scrollToEnd();
-  if (persist) {
-    threadLog.push({ kind: "msg", tone, text: clean, at: Date.now() });
-    persistThread();
-  }
+  recordMessage(role === "user" ? "user" : "assistant", value);
+  scrollThread();
   return node;
 }
 
-function addTimeline(text, { undoable = false } = {}) {
-  const clean = humanizeText(text);
-  const entry = document.createElement("div");
-  entry.className = "timeline-entry";
+function addTimeline(text, buttonLabel = null, onClick = null) {
+  const row = document.createElement("div");
+  row.className = "timeline-entry";
   const dot = document.createElement("span");
   dot.className = "dot";
-  dot.textContent = "\u2022";
+  dot.textContent = "•";
   const label = document.createElement("span");
-  label.textContent = clean;
-  entry.append(dot, label);
-  if (undoable) {
-    const undoButton = document.createElement("button");
-    undoButton.type = "button";
-    undoButton.textContent = "Undo";
-    undoButton.addEventListener("click", async () => {
-      undoButton.disabled = true;
-      await undoLastFill();
-    }, { once: true });
-    entry.append(undoButton);
+  label.textContent = cleanText(text);
+  row.append(dot, label);
+  if (buttonLabel && onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = buttonLabel;
+    button.addEventListener("click", onClick, { once: true });
+    row.append(button);
   }
-  thread.append(entry);
-  scrollToEnd();
-  threadLog.push({ kind: "timeline", text: clean, at: Date.now() });
-  persistThread();
-  return entry;
+  thread.append(row);
+  scrollThread();
+  return row;
 }
 
-function addCard({ eyebrow, title }) {
-  const card = document.createElement("div");
+function addCard(title, eyebrow = "KEEL") {
+  const card = document.createElement("section");
   card.className = "card";
   const head = document.createElement("div");
   head.className = "card-head";
-  const eyebrowNode = document.createElement("span");
-  eyebrowNode.className = "eyebrow";
-  eyebrowNode.textContent = eyebrow;
-  const titleNode = document.createElement("strong");
-  titleNode.textContent = humanizeText(title);
-  head.append(eyebrowNode, titleNode);
+  const tag = document.createElement("span");
+  tag.className = "eyebrow";
+  tag.textContent = eyebrow;
+  const strong = document.createElement("strong");
+  strong.textContent = title;
+  head.append(tag, strong);
   const body = document.createElement("div");
   body.className = "card-body";
-  const actions = document.createElement("div");
-  actions.className = "card-actions";
-  card.append(head, body, actions);
+  card.append(head, body);
   thread.append(card);
-  scrollToEnd();
-  return { card, body, actions, setTitle: (t) => { titleNode.textContent = humanizeText(t); } };
+  scrollThread();
+  return { card, body };
 }
 
-function makeButton(label, kind, onClick) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = kind;
-  button.textContent = label;
-  button.addEventListener("click", onClick);
-  return button;
+function renderStoredHistory() {
+  thread.replaceChildren();
+  for (const item of session.history || []) {
+    const node = document.createElement("div");
+    node.className = `msg ${item.role === "user" ? "user" : "keel"}`;
+    node.textContent = cleanText(item.text);
+    thread.append(node);
+  }
+  scrollThread();
 }
 
-// ---------------------------------------------------------------------------
-// Content script transport
-// ---------------------------------------------------------------------------
-async function ensureContentScript(tabId) {
+async function notify(title, message) {
+  if (!walkawayToggle.checked) return;
+  const icon = "data:image/svg+xml," + encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' width='128' height='128'><rect width='128' height='128' rx='30' fill='#102b24'/><text x='64' y='88' text-anchor='middle' font-family='Arial' font-size='72' font-weight='700' fill='#b8f36b'>K</text></svg>");
   try {
-    const reply = await chrome.tabs.sendMessage(tabId, { type: "KEEL_PING" });
-    if (reply?.ok && reply.version >= 2) return;
-  } catch (_) { /* inject below */ }
-  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    await chrome.notifications.create({ type: "basic", iconUrl: icon, title, message: cleanText(message) });
+  } catch (_) {
+    document.title = `${title}: ${cleanText(message)}`;
+  }
+}
+
+async function activeTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error("Open a normal web page so Keel can see it.");
+  activeTabId = tab.id;
+  return tab;
+}
+
+async function sendToPage(message, targetTabId = null) {
+  const tab = targetTabId ? await chrome.tabs.get(targetTabId) : await activeTab();
+  if (!tab?.id) throw new Error("The application tab is no longer open.");
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["webmcp-bridge.js"], world: "MAIN" });
-  } catch (_) { /* some pages refuse main-world scripts; WebMCP just stays off */ }
-  const reply = await chrome.tabs.sendMessage(tabId, { type: "KEEL_PING" });
-  if (!reply?.ok) throw new Error("Keel could not connect to this page.");
+    return await chrome.tabs.sendMessage(tab.id, message);
+  } catch (_) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+      return await chrome.tabs.sendMessage(tab.id, message);
+    } catch (error) {
+      throw new Error("Keel cannot read this page. Refresh it once, then try again.");
+    }
+  }
 }
 
-function sendToPage(message) {
-  if (!currentTab?.id) return Promise.reject(new Error("No page attached."));
-  return chrome.tabs.sendMessage(currentTab.id, message);
+function detectIntent(page) {
+  const text = inputKey([page?.title, page?.headings?.join(" "), page?.bodyTextSample].join(" "));
+  if (/\b(apply|application|resume|cv|candidate|career|job)\b/.test(text)) return "job_application";
+  if (/\b(checkout|payment|billing|shipping|place order|cart)\b/.test(text)) return "checkout";
+  if (/\b(sign up|create account|register|registration)\b/.test(text)) return "signup";
+  return page?.fields?.length ? "form" : "page";
 }
 
-// ---------------------------------------------------------------------------
-// Intent detection: surface-generic classification of it's-me-again pages
-// ---------------------------------------------------------------------------
-function classifyHeuristically(snapshot) {
-  const corpus = [
-    snapshot.url, snapshot.title, snapshot.metaDescription,
-    snapshot.headings.join(" "), snapshot.bodyTextSample.slice(0, 700)
-  ].join(" ").toLowerCase();
-  const fields = snapshot.fields || [];
-  const meta = fields.map((f) => f.meta).join(" ");
-  const passwords = fields.filter((f) => f.type === "password").length;
-  const emails = fields.filter((f) => f.type === "email" || /\bemail\b/.test(f.meta)).length;
-  const cardFields = fields.filter((f) => /^cc-/.test(f.autocomplete) || /\b(card number|cvv|cvc|expir|security code)\b/.test(f.meta)).length;
-  const resumeFiles = fields.filter((f) => f.type === "file" && /\b(resume|cv|cover letter)\b/.test(f.meta)).length;
-  const addressFields = fields.filter((f) => /\b(address|city|zip|postal)\b/.test(f.meta)).length;
-  const choiceFields = fields.filter((f) => ["radio", "select", "checkbox"].includes(f.type)).length;
-
-  const scores = {};
-  const bump = (kind, points) => { scores[kind] = (scores[kind] || 0) + points; };
-
-  if (cardFields >= 2) bump("checkout", 6);
-  if (/\b(checkout|payment|billing|shipping|order summary|cart|place order)\b/.test(corpus)) bump("checkout", 3);
-  if (addressFields >= 3 && /\b(shipping|delivery)\b/.test(corpus)) bump("checkout", 2);
-
-  if (resumeFiles) bump("job_application", 5);
-  if (/\b(job|jobs|career|careers|apply|application|applicant|candidate|position|vacancy|recruit)\b/.test(corpus)) bump("job_application", 3);
-  if (/greenhouse|lever\.co|workday|myworkday|ashby|smartrecruiters|icims|taleo|bamboohr|jobvite/.test(snapshot.url.toLowerCase())) bump("job_application", 5);
-  if (/\b(resume|cv|cover letter|work authorization|sponsorship)\b/.test(`${corpus} ${meta}`)) bump("job_application", 2);
-
-  if (passwords >= 2) bump("signup", 5);
-  if (passwords >= 1 && /\b(sign up|signup|register|create (an |your )?account|join|get started)\b/.test(corpus)) bump("signup", 4);
-  if (passwords === 1 && /\b(log in|login|sign in|signin|welcome back)\b/.test(corpus)) bump("login", 5);
-  if (passwords === 1 && fields.length <= 4 && !scores.signup) bump("login", 2);
-
-  if (/\b(book|booking|reservation|reserve|appointment|schedule a|check in|check out|guests|arrival|departure)\b/.test(corpus)) bump("booking", 4);
-  if (/\b(contact us|get in touch|send us a message|inquiry|enquiry)\b/.test(corpus)) bump("contact", 4);
-  if (choiceFields >= 5 && /\b(survey|questionnaire|feedback|intake|screening|assessment)\b/.test(corpus)) bump("survey", 4);
-  else if (/\b(survey|questionnaire|intake form)\b/.test(corpus)) bump("survey", 3);
-  if (emails === 1 && fields.length <= 2 && /\b(subscribe|newsletter|updates)\b/.test(corpus)) bump("subscription", 5);
-  if (/\b(account settings|edit profile|profile settings|my account|preferences)\b/.test(corpus)) bump("profile_update", 4);
-
-  let best = null;
-  let bestScore = 0;
-  for (const [kind, score] of Object.entries(scores)) {
-    if (score > bestScore) { best = kind; bestScore = score; }
+async function refreshContext({ announce = false } = {}) {
+  try {
+    const response = await sendToPage({ type: "KEEL_SNAPSHOT" });
+    if (!response?.ok) throw new Error("The page did not answer.");
+    snapshot = response.snapshot;
+    session.page = { url: snapshot.url, title: snapshot.title, host: snapshot.host };
+    const nextIntent = detectIntent(snapshot);
+    session.intent = session.intent || nextIntent;
+    contextLine.textContent = snapshot.title || snapshot.host || "Looking at this page";
+    if (announce && !session.history.length) {
+      const label = nextIntent === "job_application" ? "a job application" : nextIntent === "checkout" ? "a checkout" : nextIntent === "signup" ? "a signup" : snapshot.fields.length ? "a form" : "this page";
+      addMessage(`I am looking at ${label}. I will keep track of what you share, preview every change, and never submit without your approval.`);
+    }
+    await persistSession();
+    return snapshot;
+  } catch (error) {
+    contextLine.textContent = "Page connection needed";
+    if (announce && !session.history.length) addMessage(error.message, "keel", "warning");
+    return null;
   }
-  if (!fields.length) return { kind: "none", confidence: 0.9, source: "heuristic" };
-  if (!best) return { kind: "form", confidence: 0.4, source: "heuristic" };
-  return { kind: best, confidence: Math.min(0.95, 0.35 + bestScore * 0.08), source: "heuristic" };
 }
 
-async function classifyPage(snapshot) {
-  const heuristic = classifyHeuristically(snapshot);
-  // Remembered correction for this site wins.
-  const remembered = profile.domains?.[snapshot.host]?.intent;
-  if (remembered && INTENT_LABELS[remembered]) {
-    return { kind: remembered, confidence: 0.97, source: "memory" };
-  }
-  if (heuristic.confidence >= 0.6 || heuristic.kind === "none") return heuristic;
-
-  const refined = await assist("classify_intent", {
-    url: snapshot.url,
-    title: snapshot.title,
-    headings: snapshot.headings,
-    fieldLabels: (snapshot.fields || []).slice(0, 40).map((f) => `${f.label} (${f.type})`),
-    kinds: Object.keys(INTENT_LABELS)
-  }, { timeoutMs: 15000 });
-  const parsed = refined?.text ? parseLooseJson(refined.text) : null;
-  if (parsed?.kind && INTENT_LABELS[parsed.kind]) {
-    return { kind: parsed.kind, confidence: Math.max(heuristic.confidence, 0.7), source: "model" };
-  }
-  return heuristic;
+function missingSlots() {
+  if (session.intent !== "job_application") return [];
+  const missing = [];
+  if (!session.resume.parsed) missing.push("your resume as a PDF, DOCX, or TXT file");
+  if (!session.jobDescription.provided) missing.push("the job description as a link or pasted text");
+  return missing;
 }
 
-// ---------------------------------------------------------------------------
-// Field matching: generic profile resolver (works on any surface)
-// ---------------------------------------------------------------------------
-const AUTOCOMPLETE_MAP = {
-  "given-name": "firstName", "family-name": "lastName", "name": "fullName",
-  "email": "email", "tel": "phone", "tel-national": "phone",
-  "address-line1": "addressLine1", "address-line2": "addressLine2",
-  "street-address": "addressLine1", "address-level2": "city",
-  "address-level1": "state", "postal-code": "postalCode",
-  "country-name": "country", "country": "country", "bday": "dateOfBirth",
-  "organization": "company", "organization-title": "jobTitle", "url": "portfolio"
-};
+async function askOnce(key, text) {
+  if (session.lastQuestionKey === key) return false;
+  session.lastQuestionKey = key;
+  addMessage(text);
+  await persistSession();
+  return true;
+}
 
-const LABEL_RULES = [
-  ["firstName", /\b(first name|given name|forename|fname)\b/],
-  ["lastName", /\b(last name|family name|surname|lname)\b/],
-  ["fullName", /\b(full name|your name|candidate name|applicant name|name on card|cardholder name)\b/],
-  ["email", /\b(e ?mail|email address)\b/],
-  ["phone", /\b(phone|phone number|mobile|telephone|cell)\b/],
-  ["addressLine2", /\b(address line 2|address 2|apt|apartment|suite|unit)\b/],
-  ["addressLine1", /\b(street address|address line 1|address 1|home address|shipping address|billing address|address)\b/],
-  ["city", /\b(city|town)\b/],
-  ["state", /\b(state|province|region)\b/],
-  ["postalCode", /\b(zip|zip code|postal|postal code|postcode)\b/],
-  ["country", /\b(country|nation)\b/],
-  ["dateOfBirth", /\b(date of birth|birth ?date|dob)\b/],
-  ["linkedin", /\blinked ?in\b/],
-  ["github", /\bgithub\b/],
-  ["portfolio", /\b(portfolio|personal website|personal site|website url|web site)\b/],
-  ["company", /\b(current company|current employer|company name|employer name|company|organization)\b/],
-  ["jobTitle", /\b(current title|job title|current role|position title|occupation)\b/],
-  ["workHistory", /\b(work history|employment history|experience summary|professional experience)\b/]
-];
+function readinessSummary() {
+  const parts = [];
+  if (session.resume.parsed) parts.push(`your resume${session.resume.summary?.name ? ` for ${session.resume.summary.name}` : ""}`);
+  if (session.jobDescription.provided) parts.push(session.jobDescription.title ? `the job description for ${session.jobDescription.title}` : "the job description");
+  if (!parts.length) return "I have the current page";
+  if (parts.length === 1) return `I have ${parts[0]}`;
+  return `I have ${parts[0]} and ${parts[1]}`;
+}
 
-function matchProfileKey(field) {
-  const autocomplete = (field.autocomplete || "").toLowerCase().replace(/^(shipping|billing)\s+/, "");
-  if (AUTOCOMPLETE_MAP[autocomplete]) {
-    return { key: AUTOCOMPLETE_MAP[autocomplete], confidence: 0.95 };
+async function advanceConversation() {
+  const missing = missingSlots();
+  if (missing.length) {
+    session.phase = "collecting_context";
+    const list = missing.length === 2 ? `${missing[0]} and ${missing[1]}` : missing[0];
+    await askOnce(`missing:${missing.join("|")}`, `To prepare this application, I still need ${list}. Send both together if that is easiest.`);
+    return;
   }
-  const meta = field.meta || "";
-  for (const [key, pattern] of LABEL_RULES) {
-    if (pattern.test(meta)) return { key, confidence: 0.8 };
+  session.phase = "awaiting_start";
+  await askOnce("ready-to-plan", `${readinessSummary()}. Ready for me to draft every field and show you a preview?`);
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
+  return btoa(binary);
+}
+
+function dataUrlFor(file, base64) {
+  return `data:${file.type || "application/octet-stream"};base64,${base64}`;
+}
+
+function decodeXmlText(xmlText) {
+  const xml = new DOMParser().parseFromString(xmlText, "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error("The DOCX document XML is damaged.");
+  const paragraphs = [...xml.getElementsByTagNameNS("*", "p")];
+  return paragraphs.map((paragraph) => [...paragraph.getElementsByTagNameNS("*", "t")].map((node) => node.textContent || "").join("")).filter(Boolean).join("\n").trim();
+}
+
+async function extractDocxText(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i -= 1) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("This DOCX is not a valid ZIP document.");
+  const entryCount = view.getUint16(eocd + 10, true);
+  let offset = view.getUint32(eocd + 16, true);
+  const decoder = new TextDecoder("utf-8");
+  for (let index = 0; index < entryCount; index += 1) {
+    if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("The DOCX directory is damaged.");
+    const method = view.getUint16(offset + 10, true);
+    const compressedSize = view.getUint32(offset + 20, true);
+    const nameLength = view.getUint16(offset + 28, true);
+    const extraLength = view.getUint16(offset + 30, true);
+    const commentLength = view.getUint16(offset + 32, true);
+    const localOffset = view.getUint32(offset + 42, true);
+    const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLength));
+    if (name === "word/document.xml") {
+      if (view.getUint32(localOffset, true) !== 0x04034b50) throw new Error("The DOCX content entry is damaged.");
+      const localNameLength = view.getUint16(localOffset + 26, true);
+      const localExtraLength = view.getUint16(localOffset + 28, true);
+      const start = localOffset + 30 + localNameLength + localExtraLength;
+      const compressed = bytes.slice(start, start + compressedSize);
+      let uncompressed;
+      if (method === 0) uncompressed = compressed;
+      else if (method === 8) {
+        if (typeof DecompressionStream !== "function") throw new Error("This Chrome version cannot decompress DOCX files. Update Chrome or use PDF or TXT.");
+        const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+        uncompressed = new Uint8Array(await new Response(stream).arrayBuffer());
+      } else throw new Error(`This DOCX uses unsupported compression method ${method}.`);
+      const text = decodeXmlText(decoder.decode(uncompressed));
+      if (!text) throw new Error("The DOCX contains no readable resume text.");
+      return text;
+    }
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  throw new Error("This DOCX has no readable word/document.xml entry.");
+}
+
+async function uploadForAnalysis(file, base64) {
+  const response = await fetch(`${API_ORIGIN}/api/upload/image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-App-Id": APP_ID },
+    body: JSON.stringify({ imageData: dataUrlFor(file, base64), fileName: file.name })
+  });
+  if (!response.ok) throw new Error(`Upload failed with status ${response.status}.`);
+  const data = await response.json();
+  const url = data.imageUrl || data.fileUrl || data.url;
+  if (!url) throw new Error("The upload service did not return a document URL.");
+  return url;
+}
+
+async function analyzePdf(file, base64) {
+  const documentUrl = await uploadForAnalysis(file, base64);
+  const analysisPrompt = "Read this resume accurately. Return strict JSON with keys fullText, name, mostRecentRole, skills (array of 2 to 6 factual skills), email, phone, linkedin, company. fullText must contain the resume text you actually read. Do not infer facts that are absent.";
+  const response = await fetch(`${API_ORIGIN}/api/analyze-document`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-App-Id": APP_ID },
+    body: JSON.stringify({ documentUrl, analysisPrompt, documentType: "pdf" })
+  });
+  if (!response.ok) throw new Error(`PDF analysis failed with status ${response.status}.`);
+  const data = await response.json();
+  if (!data.success && !data.analysis) throw new Error(data.error || "The PDF analysis service returned no text.");
+  const parsed = typeof data.analysis === "object" ? data.analysis : parseLooseJson(data.analysis);
+  if (!parsed?.fullText || String(parsed.fullText).trim().length < 40) throw new Error("No readable resume text was found in this PDF. If it is a scan, export it as a searchable PDF, DOCX, or TXT file.");
+  return { text: String(parsed.fullText).trim(), facts: parsed };
+}
+
+function fallbackResumeFacts(text) {
+  const lines = String(text).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const email = String(text).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || "";
+  const phone = String(text).match(/(?:\+?\d[\d ().-]{7,}\d)/)?.[0] || "";
+  const name = lines[0] && lines[0].length < 70 && !/@|resume|curriculum/i.test(lines[0]) ? lines[0] : "";
+  const roleLine = lines.find((line) => /\b(engineer|developer|designer|manager|analyst|director|consultant|specialist|lead|founder|product|marketing|sales|operations)\b/i.test(line)) || "";
+  const skillWords = ["JavaScript", "TypeScript", "React", "Python", "Java", "SQL", "AWS", "Azure", "Figma", "Product management", "Machine learning", "Data analysis"];
+  const skills = skillWords.filter((skill) => new RegExp(`\\b${skill.replace(" ", "\\s+")}\\b`, "i").test(text)).slice(0, 5);
+  return { name, mostRecentRole: roleLine.slice(0, 100), skills, email, phone };
+}
+
+async function summarizeResume(text, suppliedFacts = null) {
+  let facts = suppliedFacts;
+  if (!facts) {
+    const result = await assist("parse_resume", {
+      resumeText: String(text).slice(0, 24000),
+      instruction: "Return strict JSON with name, mostRecentRole, skills, email, phone, linkedin, company. Use only facts in the resume."
+    }, { timeoutMs: 60000 });
+    facts = result?.json || parseLooseJson(result?.text);
+    if (!facts) {
+      const response = await fetch(`${API_ORIGIN}/proxy/openai/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-App-Id": APP_ID },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "Extract only facts present in this resume. Return strict JSON with name, mostRecentRole, skills, email, phone, linkedin, company. Never infer missing facts." },
+            { role: "user", content: String(text).slice(0, 24000) }
+          ],
+          max_tokens: 800,
+          temperature: 0,
+          stream: false,
+          response_format: { type: "json_object" }
+        })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        facts = parseLooseJson(data.choices?.[0]?.message?.content);
+      }
+    }
+  }
+  facts = { ...fallbackResumeFacts(text), ...(facts || {}) };
+  if (!Array.isArray(facts.skills)) facts.skills = String(facts.skills || "").split(/,|\n/).map((item) => item.trim()).filter(Boolean);
+  facts.skills = facts.skills.slice(0, 6);
+  return facts;
+}
+
+async function mergeResumeIntoProfile(facts, text, fileName = null) {
+  const updates = {};
+  if (facts.name) updates.fullName = facts.name;
+  if (facts.email) updates.email = facts.email;
+  if (facts.phone) updates.phone = facts.phone;
+  if (facts.linkedin) updates.linkedin = facts.linkedin;
+  if (facts.mostRecentRole) updates.jobTitle = facts.mostRecentRole;
+  if (facts.company) updates.company = facts.company;
+  updates.workHistory = String(text).slice(0, 12000);
+  for (const [key, value] of Object.entries(updates)) if (value) setProfileValue(profile, key, value);
+  profile.documents = profile.documents || {};
+  profile.documents.resume = {
+    fileName: fileName || session.resume.fileName || null,
+    text: String(text).slice(0, 24000),
+    summary: facts,
+    parsedAt: new Date().toISOString()
+  };
+  await saveProfile(profile);
+}
+
+function resumeProof(facts) {
+  const pieces = [];
+  if (facts.name) pieces.push(`Name: ${facts.name}`);
+  if (facts.mostRecentRole) pieces.push(`Most recent role: ${facts.mostRecentRole}`);
+  if (facts.skills?.length) pieces.push(`Skills: ${facts.skills.slice(0, 3).join(", ")}`);
+  return pieces.length ? pieces.join("\n") : "I extracted the text and saved it to your profile, but the document did not clearly label a name, recent role, or skills.";
+}
+
+async function ingestResume(file) {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  if (!["pdf", "docx", "txt"].includes(extension)) throw new Error("Use a PDF, DOCX, or TXT resume.");
+  if (file.size > 32 * 1024 * 1024) throw new Error("This file is over 32 MB. Use a smaller PDF, DOCX, or TXT resume.");
+  const buffer = await file.arrayBuffer();
+  const base64 = arrayBufferToBase64(buffer);
+  let text;
+  let suppliedFacts = null;
+  if (extension === "txt") text = new TextDecoder("utf-8").decode(buffer).trim();
+  else if (extension === "docx") text = await extractDocxText(buffer);
+  else {
+    const analyzed = await analyzePdf(file, base64);
+    text = analyzed.text;
+    suppliedFacts = analyzed.facts;
+  }
+  if (!text || text.length < 40) throw new Error(`The ${extension.toUpperCase()} file did not contain enough readable resume text.`);
+  const facts = await summarizeResume(text, suppliedFacts);
+  const doc = await saveDocument("resume", {
+    name: file.name,
+    mime: file.type || (extension === "pdf" ? "application/pdf" : extension === "docx" ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document" : "text/plain"),
+    dataBase64: base64,
+    text,
+    summary: facts
+  });
+  documents.resume = doc;
+  await mergeResumeIntoProfile(facts, text, file.name);
+  session.resume = { uploaded: true, parsed: true, fileName: file.name, summary: facts, text, error: null };
+  session.lastQuestionKey = null;
+  await persistSession();
+  addMessage(`I read ${file.name} and saved the parsed resume to your reusable profile.\n${resumeProof(facts)}`, "keel", "success");
+  await advanceConversation();
+}
+
+async function storeJobDescription(input) {
+  let text = String(input || "").trim();
+  let source = "pasted";
+  if (looksLikeUrl(text)) {
+    source = text;
+    addTimeline("Reading the job posting link");
+    text = await fetchJobDescription(text);
+  }
+  const titleMatch = text.match(/(?:job title|position|role)\s*[:\-]\s*([^\n]{3,100})/i);
+  const pageTitle = snapshot?.title?.replace(/\s*[|\-].*$/, "").trim();
+  session.jobDescription = {
+    provided: true,
+    source,
+    text: text.slice(0, 20000),
+    title: titleMatch?.[1]?.trim() || (session.intent === "job_application" ? pageTitle : null)
+  };
+  session.lastQuestionKey = null;
+  await persistSession();
+  addMessage(`Got it. I saved the job description${session.jobDescription.title ? ` for ${session.jobDescription.title}` : ""}. I will not ask for it again.`);
+  await advanceConversation();
+}
+
+function applyNaturalProfileUpdates(text) {
+  const patterns = [
+    ["fullName", /\b(?:my name is|i am called)\s+([^,.\n]{2,80})/i],
+    ["email", /\b(?:my email is|email[: ]+)\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i],
+    ["phone", /\b(?:my phone(?: number)? is|phone[: ]+)\s*([+\d][\d ().-]{7,})/i],
+    ["linkedin", /(https?:\/\/(?:www\.)?linkedin\.com\/[^\s]+)/i],
+    ["country", /\b(?:i live in|my country is)\s+([^,.\n]{2,60})/i],
+    ["city", /\b(?:my city is|i am based in)\s+([^,.\n]{2,60})/i]
+  ];
+  const updates = {};
+  for (const [key, pattern] of patterns) {
+    const match = String(text).match(pattern);
+    if (match?.[1]) updates[key] = match[1].trim();
+  }
+  return updates;
+}
+
+async function callControllerModel(payload) {
+  const system = "You are Keel's conversation controller. Return strict JSON only with keys profileUpdates, jobDescriptionText, action, and reply. action must be one of start, preview, undo, tailor_resume, wait, answer, none. The supplied state is authoritative. Never ask for a slot marked present. A natural affirmation means start when phase is awaiting_start. Be concise, factual, human, and never use em dashes.";
+  const response = await fetch(`${API_ORIGIN}/proxy/openai/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-App-Id": APP_ID },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify(payload) }],
+      max_tokens: 800,
+      temperature: 0.1,
+      stream: false,
+      response_format: { type: "json_object" }
+    })
+  });
+  if (!response.ok) return null;
+  const data = await response.json();
+  return parseLooseJson(data.choices?.[0]?.message?.content);
+}
+
+async function interpretWithModel(text) {
+  const payload = {
+    message: String(text).slice(0, 5000),
+    state: {
+      phase: session.phase,
+      intent: session.intent,
+      resume: { uploaded: session.resume.uploaded, parsed: session.resume.parsed, summary: session.resume.summary },
+      jobDescription: { provided: session.jobDescription.provided, source: session.jobDescription.source, title: session.jobDescription.title },
+      openQuestionsDrafted: session.openQuestionsDrafted,
+      approvalToProceed: session.approvalToProceed,
+      page: session.page
+    },
+    history: session.history.slice(-12)
+  };
+  const result = await assist("conversation_controller", {
+    ...payload,
+    instruction: "Return JSON only. Extract profileUpdates, jobDescriptionText, and one action from start, preview, undo, tailor_resume, wait, answer, none. Never request a slot already marked present. Treat natural affirmations as start when phase is awaiting_start. Never use em dashes."
+  }, { timeoutMs: 45000 });
+  return result?.json || parseLooseJson(result?.text) || await callControllerModel(payload);
+}
+
+async function applyProfileUpdates(updates) {
+  let changed = false;
+  for (const [key, value] of Object.entries(updates || {})) {
+    if (value == null || String(value).trim() === "") continue;
+    setProfileValue(profile, key, value);
+    changed = true;
+  }
+  if (changed) await saveProfile(profile);
+  return changed;
+}
+
+function matchProfileValue(field, flat) {
+  const meta = inputKey(`${field.label} ${field.meta} ${field.autocomplete}`);
+  const rules = [
+    ["firstName", /\b(first name|given name|given-name)\b/],
+    ["lastName", /\b(last name|family name|surname|family-name)\b/],
+    ["fullName", /\b(full name|your name|legal name|name)\b/],
+    ["email", /\b(email|e mail)\b/],
+    ["phone", /\b(phone|mobile|telephone|tel)\b/],
+    ["addressLine1", /\b(street|address line 1|address-line1|home address)\b/],
+    ["addressLine2", /\b(address line 2|apartment|suite|unit)\b/],
+    ["city", /\b(city|town|address-level2)\b/],
+    ["state", /\b(state|province|region|address-level1)\b/],
+    ["postalCode", /\b(postal|zip|postcode|postal-code)\b/],
+    ["country", /\b(country|country-name)\b/],
+    ["linkedin", /\blinkedin\b/],
+    ["github", /\bgithub\b/],
+    ["portfolio", /\b(portfolio|personal website)\b/],
+    ["company", /\b(current company|employer|company)\b/],
+    ["jobTitle", /\b(current title|job title|current role)\b/]
+  ];
+  for (const [key, regex] of rules) if (regex.test(meta) && flat[key]) return { value: flat[key], key };
   return null;
 }
 
-function isOpenEndedQuestion(field) {
-  if (field.type === "textarea") return true;
-  if (field.maxLength && field.maxLength >= 200) return true;
-  return /\b(why|describe|tell us|explain|what interests|cover letter|anything else|additional information)\b/.test(field.meta || "");
+function optionValue(field, wanted) {
+  if (!field.options?.length || wanted == null) return String(wanted || "");
+  const target = inputKey(wanted);
+  let best = field.options.find((option) => inputKey(option) === target);
+  if (!best) best = field.options.find((option) => inputKey(option).includes(target) || target.includes(inputKey(option)));
+  return best || "";
 }
 
-// ---------------------------------------------------------------------------
-// Plan: propose everything, preview everything, apply only what is approved
-// ---------------------------------------------------------------------------
-async function buildPlan(sequenceAtStart) {
-  const snapshot = session.snapshot;
-  const flat = flatProfile(profile);
-  const host = snapshot.host;
-  const rows = [];
-  const specials = [];
-  const unresolved = [];
-
-  for (const field of snapshot.fields) {
-    if (field.type === "password") { specials.push({ field, kind: "password" }); continue; }
-    if (field.isOtp) { specials.push({ field, kind: "otp" }); continue; }
-    if (field.type === "file") { specials.push({ field, kind: "file" }); continue; }
-    if (field.currentValue) {
-      rows.push({ field, proposed: field.currentValue, source: "already on the page", confidence: 1, include: false, keep: true });
-      continue;
-    }
-
-    const profileHit = matchProfileKey(field);
-    if (profileHit && flat[profileHit.key]) {
-      rows.push({ field, proposed: String(flat[profileHit.key]), source: "profile", confidence: profileHit.confidence, include: true, profileKey: profileHit.key });
-      continue;
-    }
-    const learned = lookupAnswer(profile, field.label, host);
-    if (learned) {
-      rows.push({
-        field, proposed: learned.value,
-        source: learned.scope === "site" ? "remembered for this site" : "remembered answer",
-        confidence: learned.fuzzy ? 0.65 : (learned.scope === "site" ? 0.9 : 0.8),
-        include: true, learnedQuestion: field.label
-      });
-      continue;
-    }
-    if (profileHit) {
-      rows.push({ field, proposed: "", source: "profile (empty)", confidence: 0.3, include: false, profileKey: profileHit.key, needsAnswer: true });
-      continue;
-    }
-    unresolved.push(field);
+async function draftField(field, flat) {
+  if (field.currentValue) return null;
+  if (field.type === "password" || field.isOtp) return { field, value: "", confidence: "low", source: "Your input", selected: false, protected: true };
+  if (field.type === "file") {
+    if (documents.resume) return { field, value: documents.resume.name, confidence: "high", source: "Saved resume", selected: true, file: documents.resume };
+    return { field, value: "", confidence: "low", source: "File needed", selected: false };
   }
-
-  // Consent decisions (terms, privacy, marketing opt-ins) are never drafted.
-  // They stay in the preview for the user to decide.
-  const isConsent = (field) => /\b(terms|privacy|consent|i agree|marketing|opt in|opt out)\b/.test(field.meta || "");
-
-  // Draft the rest proactively instead of interrogating the user field by field.
-  const draftCandidates = unresolved.filter((f) => !isConsent(f));
-  const consentFields = unresolved.filter(isConsent);
-  for (const field of consentFields) {
-    rows.push({ field, proposed: "", source: "your decision", confidence: 0.2, include: false, needsAnswer: true, learnedQuestion: field.label });
+  const known = matchProfileValue(field, flat);
+  if (known) return { field, value: optionValue(field, known.value), confidence: "high", source: "Profile", selected: true, profileKey: known.key };
+  const learned = lookupAnswer(profile, field.label, snapshot?.host);
+  if (learned) return { field, value: optionValue(field, learned.value), confidence: learned.fuzzy ? "medium" : "high", source: learned.scope === "site" ? "This site" : "Learned", selected: true };
+  const meta = inputKey(`${field.label} ${field.meta}`);
+  if (field.type === "textarea" || /\b(why|describe|tell us|cover letter|motivation|experience|interested|anything else)\b/.test(meta)) {
+    const answer = await answerOpenQuestion({
+      question: field.label,
+      resumeText: session.resume.text || documents.resume?.text || "",
+      jobDescription: session.jobDescription.text || snapshot?.bodyTextSample || "",
+      profileSummary: profileSummaryText(profile),
+      maxLength: field.maxLength
+    });
+    if (answer) return { field, value: answer.slice(0, field.maxLength || 5000), confidence: "medium", source: "Drafted from resume", selected: true };
   }
-  if (draftCandidates.length && sequenceAtStart === attachSequence) {
-    const drafted = await draftValues(draftCandidates, snapshot);
-    for (const field of draftCandidates) {
-      const draft = drafted?.[field.id];
-      if (draft && draft.value) {
-        rows.push({ field, proposed: String(draft.value), source: "drafted for you", confidence: Math.min(0.7, draft.confidence || 0.55), include: true, learnedQuestion: field.label, drafted: true });
-      } else {
-        rows.push({ field, proposed: "", source: "needs your answer", confidence: 0.2, include: false, needsAnswer: true, learnedQuestion: field.label });
-      }
+  if (field.type === "checkbox") {
+    const isConsent = /\b(terms|privacy|consent|agree|certify)\b/.test(meta);
+    return { field, value: isConsent ? "No" : "No", confidence: "low", source: "Confirm", selected: false };
+  }
+  if (field.type === "radio" || field.type === "select") return { field, value: "", confidence: "low", source: "Choose", selected: false };
+  return { field, value: "", confidence: "low", source: "Needed", selected: false };
+}
+
+function controlForPlanItem(item) {
+  let control;
+  if (item.field.type === "radio" || item.field.type === "select" || item.field.type === "checkbox") {
+    control = document.createElement("select");
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "Choose an answer";
+    control.append(empty);
+    const options = item.field.type === "checkbox" ? ["Yes", "No"] : item.field.options;
+    for (const option of options || []) {
+      const node = document.createElement("option");
+      node.value = option;
+      node.textContent = option;
+      control.append(node);
     }
+    control.value = item.value || "";
+  } else if (item.field.type === "textarea") {
+    control = document.createElement("textarea");
+    control.value = item.value || "";
   } else {
-    for (const field of draftCandidates) {
-      rows.push({ field, proposed: "", source: "needs your answer", confidence: 0.2, include: false, needsAnswer: true, learnedQuestion: field.label });
-    }
+    control = document.createElement("input");
+    control.type = "text";
+    control.value = item.value || "";
+    if (item.field.type === "file" || item.protected) control.readOnly = true;
   }
-
-  // Preserve page order.
-  const order = new Map(snapshot.fields.map((f, i) => [f.id, i]));
-  rows.sort((a, b) => (order.get(a.field.id) ?? 0) - (order.get(b.field.id) ?? 0));
-  return { rows, specials };
+  control.addEventListener("input", () => {
+    item.value = control.value;
+    if (control.value && !item.protected) item.selected = true;
+    item.checkbox.checked = item.selected;
+    item.row.classList.toggle("excluded", !item.selected);
+  });
+  return control;
 }
 
-async function draftValues(fields, snapshot) {
-  // Open-ended job questions get the tailored treatment later; only draft
-  // short factual values here.
-  const draftable = fields.filter((f) => !isOpenEndedQuestion(f)).slice(0, 25);
-  if (!draftable.length) return {};
-  const result = await assist("draft_values", {
-    intent: session.intent?.kind || "form",
-    pageTitle: snapshot.title,
-    host: snapshot.host,
-    profileSummary: profileSummaryText(profile),
-    fields: draftable.map((f) => ({
-      id: f.id, label: f.label, type: f.type, required: f.required,
-      options: (f.options || []).slice(0, 30)
-    }))
-  }, { timeoutMs: 30000 });
-  const parsed = result?.text ? parseLooseJson(result.text) : null;
-  if (!parsed || typeof parsed !== "object") return {};
-  const map = {};
-  const values = parsed.values || parsed;
-  for (const [id, value] of Object.entries(values)) {
-    if (value == null || value === "" || value === "skip") continue;
-    map[id] = typeof value === "object" ? value : { value, confidence: 0.55 };
-  }
-  return map;
-}
-
-function confidenceClass(confidence) {
-  if (confidence >= 0.75) return "high";
-  if (confidence >= 0.5) return "medium";
-  return "low";
-}
-
-function renderPlanCard(plan) {
-  const intentLabel = INTENT_LABELS[session.intent?.kind] || "this form";
-  const { card, body, actions } = addCard({ eyebrow: "Preview", title: `My plan for ${intentLabel}` });
-  const editableRows = [];
-
+function renderPlan(plan) {
+  const { card, body } = addCard("Review every field before Keel fills it", "PREVIEW");
   const note = document.createElement("p");
   note.className = "card-note";
-  note.textContent = "Nothing touches the page until you approve it. Edit any value, untick what you want me to leave alone. Green means I am sure, amber means check me, red means I need you.";
+  note.textContent = "Green is from your profile, amber is drafted, and red needs you. Nothing is submitted.";
   body.append(note);
-
-  for (const row of plan.rows) {
-    if (row.keep) continue;
-    const rowNode = document.createElement("div");
-    rowNode.className = "plan-row";
-
+  for (const item of plan.items) {
+    const row = document.createElement("label");
+    row.className = `plan-row${item.selected ? "" : " excluded"}`;
+    item.row = row;
     const check = document.createElement("input");
     check.type = "checkbox";
     check.className = "row-check";
-    check.checked = row.include && Boolean(row.proposed);
-
-    const labelWrap = document.createElement("div");
-    labelWrap.className = "row-label";
+    check.checked = item.selected;
+    item.checkbox = check;
+    check.addEventListener("change", () => {
+      item.selected = check.checked;
+      row.classList.toggle("excluded", !item.selected);
+    });
+    const label = document.createElement("div");
+    label.className = "row-label";
     const conf = document.createElement("span");
-    conf.className = `conf ${confidenceClass(row.confidence)}`;
-    conf.title = `Confidence: ${confidenceClass(row.confidence)}`;
-    const labelText = document.createElement("span");
-    const cleanLabel = row.field.label.replace(/\s*\*+\s*$/, "");
-    labelText.textContent = cleanLabel + (row.field.required ? " *" : "");
+    conf.className = `conf ${item.confidence}`;
+    const name = document.createElement("span");
+    name.textContent = item.field.label;
     const source = document.createElement("span");
     source.className = "row-source";
-    source.textContent = row.source;
-    labelWrap.append(conf, labelText, source);
-
-    let input;
-    if (row.field.options?.length && ["select", "radio"].includes(row.field.type)) {
-      input = document.createElement("select");
-      const blank = document.createElement("option");
-      blank.value = "";
-      blank.textContent = "Choose...";
-      input.append(blank);
-      for (const option of row.field.options) {
-        const node = document.createElement("option");
-        node.value = option;
-        node.textContent = option;
-        input.append(node);
-      }
-      if (row.proposed) {
-        const exact = row.field.options.find((o) => o.toLowerCase() === row.proposed.toLowerCase())
-          || row.field.options.find((o) => o.toLowerCase().includes(row.proposed.toLowerCase()));
-        if (exact) input.value = exact;
-      }
-    } else if (row.field.type === "checkbox") {
-      input = document.createElement("select");
-      for (const option of ["", "Yes", "No"]) {
-        const node = document.createElement("option");
-        node.value = option;
-        node.textContent = option || "Choose...";
-        input.append(node);
-      }
-      input.value = row.proposed || "";
-    } else if (row.field.type === "textarea" || isOpenEndedQuestion(row.field)) {
-      input = document.createElement("textarea");
-      input.value = row.proposed || "";
-      input.placeholder = "I can draft this. Say: draft the open questions";
-    } else {
-      input = document.createElement("input");
-      input.type = "text";
-      input.value = row.proposed || "";
-      input.placeholder = row.needsAnswer ? "Type the answer" : "";
-    }
-    input.addEventListener("input", () => {
-      check.checked = Boolean(input.value || input.value === "0");
-      rowNode.classList.toggle("excluded", !check.checked);
-    });
-    check.addEventListener("change", () => rowNode.classList.toggle("excluded", !check.checked));
-    rowNode.classList.toggle("excluded", !check.checked);
-
-    rowNode.append(check, labelWrap, input);
-    // grid: checkbox spans, label row, input row
-    body.append(rowNode);
-    editableRows.push({ row, check, input });
+    source.textContent = item.source;
+    label.append(conf, name, source);
+    const control = controlForPlanItem(item);
+    item.control = control;
+    row.append(check, label, control);
+    body.append(row);
   }
-
-  const keptCount = plan.rows.filter((r) => r.keep).length;
-  if (keptCount) {
-    const kept = document.createElement("p");
-    kept.className = "card-note";
-    kept.textContent = `${keptCount} field${keptCount === 1 ? " already has" : "s already have"} an answer on the page. I will not touch those.`;
-    body.append(kept);
-  }
-
-  const applyButton = makeButton("Fill the approved fields", "primary", async () => {
-    applyButton.disabled = true;
-    await applyPlan(editableRows, plan);
-    applyButton.disabled = false;
+  const actions = document.createElement("div");
+  actions.className = "card-actions";
+  const fill = document.createElement("button");
+  fill.type = "button";
+  fill.className = "primary";
+  fill.textContent = "Fill approved fields";
+  fill.addEventListener("click", async () => {
+    fill.disabled = true;
+    try { await applyPlan(plan); card.remove(); }
+    catch (error) { addMessage(error.message, "keel", "warning"); fill.disabled = false; }
   });
-  const rescanButton = makeButton("Rescan page", "secondary", () => attachToTab(true));
-  actions.append(applyButton, rescanButton);
-
-  session.planCard = card;
-  return editableRows;
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "secondary";
+  cancel.textContent = "Not yet";
+  cancel.addEventListener("click", () => { session.phase = "awaiting_start"; persistSession(); card.remove(); });
+  actions.append(fill, cancel);
+  card.append(actions);
 }
 
-async function applyPlan(editableRows, plan) {
-  if (session?.plan !== plan) {
-    addMsg("That plan belongs to a page you have left. Say \"go ahead\" and I will draft the page you are on now.", "warning");
-    return;
+async function preparePlan() {
+  busy = true;
+  session.approvalToProceed = true;
+  session.phase = "drafting";
+  session.lastQuestionKey = null;
+  await persistSession();
+  addTimeline("Scanning the active tab and drafting answers");
+  try {
+    const page = await refreshContext();
+    if (!page) throw new Error("I cannot scan the active tab yet. Refresh the page once and try again.");
+    const operationTabId = activeTabId;
+    const response = await sendToPage({ type: "KEEL_SCAN" }, operationTabId);
+    if (!response?.ok) throw new Error("The page scan failed.");
+    const flat = flatProfile(profile);
+    const items = [];
+    for (const field of response.fields || []) {
+      const item = await draftField(field, flat);
+      if (item) items.push(item);
+    }
+    if (!items.length) {
+      session.phase = "ready";
+      addMessage("I did not find any empty fields on the active page.");
+      await persistSession();
+      return;
+    }
+    session.openQuestionsDrafted = items.some((item) => item.field.type === "textarea" && item.value);
+    session.phase = "preview";
+    currentPlan = { items, buttons: response.buttons || [], captchaPresent: response.captchaPresent, tabId: operationTabId };
+    renderPlan(currentPlan);
+    await persistSession();
+    await notify("Keel preview is ready", `Review ${items.length} drafted fields before filling.`);
+  } finally {
+    busy = false;
   }
-  const actions = [];
-  const host = session.snapshot?.host;
-  let learnedCount = 0;
+}
 
-  for (const { row, check, input } of editableRows) {
-    const value = String(input.value || "").trim();
-    if (!check.checked || !value) continue;
-    actions.push({ fieldId: row.field.id, value });
-
-    // Learning: user edits and fresh answers become durable memory.
-    const wasEdited = value !== String(row.proposed || "").trim();
-    if (row.profileKey && (wasEdited || row.needsAnswer)) {
-      setProfileValue(profile, row.profileKey, value);
-      learnedCount += 1;
-    } else if (row.learnedQuestion && (wasEdited || row.needsAnswer || row.drafted)) {
-      rememberAnswer(profile, row.learnedQuestion, value);
-      if (host) rememberAnswer(profile, row.learnedQuestion, value, host);
-      learnedCount += 1;
+async function applyPlan(plan) {
+  const chosen = plan.items.filter((item) => item.selected && String(item.value || "").trim());
+  if (!chosen.length) throw new Error("Choose at least one field to fill.");
+  const regular = chosen.filter((item) => item.field.type !== "file").map((item) => ({ fieldId: item.field.id, value: item.value }));
+  const files = chosen.filter((item) => item.field.type === "file" && item.file);
+  let undoId = null;
+  let successes = 0;
+  if (regular.length) {
+    const result = await sendToPage({ type: "KEEL_APPLY", actions: regular }, plan.tabId);
+    if (!result?.ok) throw new Error("The page rejected the fill operation.");
+    undoId = result.undoId;
+    for (const row of result.results || []) {
+      if (row.ok) successes += 1;
+      else addMessage(`${row.label || "A field"}: ${row.error}`, "keel", "warning");
     }
   }
-
-  if (!actions.length) {
-    addMsg("Nothing is approved yet. Tick the fields you want me to fill, or give me the missing answers.", "warning");
-    return;
+  for (const item of files) {
+    const result = await sendToPage({ type: "KEEL_ATTACH_FILE", fieldId: item.field.id, file: { name: item.file.name, mime: item.file.mime, dataBase64: item.file.dataBase64 } }, plan.tabId);
+    if (result?.ok) successes += 1;
+    else addMessage(result?.error || `Could not attach ${item.file.name}.`, "keel", "warning");
   }
-
-  if (learnedCount) await saveProfile(profile);
-
-  addMsg(`Filling ${actions.length} field${actions.length === 1 ? "" : "s"} now. Watch the page, every target gets highlighted first.`);
-  let reply;
-  try {
-    reply = await sendToPage({ type: "KEEL_APPLY", actions });
-  } catch (error) {
-    addMsg(`I lost the page connection: ${error.message}. Refresh the tab and I will rescan.`, "warning");
-    return;
+  for (const item of chosen) {
+    if (item.profileKey) setProfileValue(profile, item.profileKey, item.value);
+    rememberAnswer(profile, item.field.label, item.value, snapshot?.host);
   }
-
-  const okResults = (reply?.results || []).filter((r) => r.ok);
-  const failed = (reply?.results || []).filter((r) => !r.ok);
-  session.fills += okResults.length;
-
-  if (okResults.length) {
-    addTimeline(`Filled ${okResults.length} field${okResults.length === 1 ? "" : "s"}: ${okResults.map((r) => r.label).slice(0, 6).join(", ")}${okResults.length > 6 ? "..." : ""}`, { undoable: true });
-  }
-  for (const failure of failed) {
-    addMsg(`"${failure.label}": ${failure.error} Tell me the right answer and I will fill it.`, "warning");
-  }
-  if (learnedCount) {
-    addTimeline(`Remembered ${learnedCount} answer${learnedCount === 1 ? "" : "s"} for next time.`);
-  }
-
-  await afterFillFollowUps(plan);
+  await saveProfile(profile);
+  session.phase = "filled";
+  await persistSession();
+  addTimeline(`Filled ${successes} approved field${successes === 1 ? "" : "s"}`, undoId ? "Undo" : null, undoId ? undoLastFill : null);
+  if (plan.captchaPresent) addMessage("A verification check is waiting on the page. Complete it yourself, then come back here.", "keel", "warning");
+  const protectedItems = plan.items.filter((item) => item.protected);
+  if (protectedItems.length) addMessage(`Your turn for: ${protectedItems.map((item) => item.field.label).join(", ")}. I do not guess passwords or verification codes.`);
+  renderSubmitPreview(plan.buttons, plan.tabId);
+  await notify("Keel finished filling", `${successes} fields are filled. Submission is still waiting for you.`);
 }
 
 async function undoLastFill() {
   try {
-    const reply = await sendToPage({ type: "KEEL_UNDO" });
-    if (reply?.ok) {
-      addTimeline(`Undid the last fill (${reply.restored.length} field${reply.restored.length === 1 ? "" : "s"} restored).`);
-    } else {
-      addMsg(reply?.error || "There was nothing to undo.", "warning");
-    }
+    const result = await sendToPage({ type: "KEEL_UNDO" }, currentPlan?.tabId || null);
+    addMessage(result?.ok ? `Restored ${result.restored.length} field${result.restored.length === 1 ? "" : "s"}.` : result?.error || "There is nothing to undo.");
   } catch (error) {
-    addMsg(`I could not undo: ${error.message}`, "warning");
+    addMessage(error.message, "keel", "warning");
   }
 }
 
-// ---------------------------------------------------------------------------
-// After the fill: files, captcha, submit preview, walk-away notification
-// ---------------------------------------------------------------------------
-async function afterFillFollowUps(plan) {
-  for (const special of plan.specials) {
-    if (special.kind === "file") await offerFileAttach(special.field);
-    if (special.kind === "password") {
-      addMsg(`"${special.field.label}" is a password field. I never read, store, or type passwords. Enter it directly on the page.`, "warning");
-    }
-    if (special.kind === "otp") {
-      addMsg(`"${special.field.label}" looks like a verification code. Complete the check on your phone or email, type the code on the page, then tell me to continue.`, "warning");
-    }
-  }
-
-  if (session.snapshot?.captchaPresent) {
-    await handleCaptchaHandBack();
-  }
-
-  await offerSubmitPreview();
-
-  if (walkAway) {
-    const stuck = plan.rows.some((r) => r.needsAnswer && r.field.required);
-    notify(
-      stuck ? "Keel needs you" : "Keel finished this page",
-      stuck
-        ? `I filled what I could on ${session.snapshot.host} but some required answers need you.`
-        : `Everything I could fill on ${session.snapshot.host} is done and previewed. Nothing was submitted.`
-    );
-  }
-}
-
-async function offerFileAttach(field) {
-  const wantsResume = /\b(resume|cv)\b/.test(field.meta || "");
-  const wantsCover = /\bcover letter\b/.test(field.meta || "");
-  const tailored = await getDocument("tailoredResume");
-  const resume = await getDocument("resume");
-  const doc = wantsCover ? await getDocument("coverLetter") : (tailored || resume);
-
-  if (!doc || (!wantsResume && !wantsCover)) {
-    addMsg(`"${field.label}" needs a file. Upload one here with the paperclip and I will attach it, or choose it on the page yourself.`, "warning");
+function renderSubmitPreview(buttons = [], tabId = null) {
+  const commit = buttons.find((button) => button.commits);
+  if (!commit) {
+    addMessage("The fields are filled. I did not find a final submit button, so review the page and continue when ready.");
     return;
   }
-
-  const { body, actions, card } = addCard({ eyebrow: "Your file", title: `Attach to "${field.label}"?` });
+  const { card, body } = addCard("Final action stays with you", "SUBMIT PREVIEW");
   const note = document.createElement("p");
   note.className = "card-note";
-  note.textContent = `I have "${doc.name}" saved${doc === tailored ? " (tailored for this job)" : ""}. Want me to attach it?`;
+  note.textContent = `Keel has not clicked “${commit.text || "Submit"}”. Review the page first.`;
   body.append(note);
-  actions.append(
-    makeButton(`Attach ${doc.name}`, "primary", async () => {
-      const reply = await sendToPage({ type: "KEEL_ATTACH_FILE", fieldId: field.id, file: { name: doc.name, mime: doc.mime, dataBase64: doc.dataBase64 } });
-      card.remove();
-      if (reply?.ok) addTimeline(`Attached ${doc.name} to "${field.label}".`);
-      else addMsg(reply?.error || "The page did not accept the file.", "warning");
-    }),
-    makeButton("I will handle it", "secondary", () => card.remove())
-  );
-}
-
-async function handleCaptchaHandBack() {
-  sendToPage({ type: "KEEL_HIGHLIGHT_CAPTCHA" }).catch(() => {});
-  const { body, actions, card } = addCard({ eyebrow: "Your turn", title: "Human check on the page" });
-  const note = document.createElement("p");
-  note.className = "card-note";
-  note.textContent = "There is a CAPTCHA or verification step. I never solve those. Do it on the page, then tap continue and I will pick up exactly where I left off.";
-  body.append(note);
-  await new Promise((resolve) => {
-    actions.append(makeButton("Done, continue", "primary", () => { card.remove(); resolve(); }));
-  });
-  addTimeline("You handled the verification. Continuing.");
-  await refreshSnapshot();
-}
-
-async function offerSubmitPreview() {
-  if (session.submitOffered) return;
-  const buttons = (session.snapshot?.buttons || []).filter((b) => b.commits);
-  if (!buttons.length) return;
-  session.submitOffered = true;
-
-  const target = buttons[0];
-  const { body, actions, card } = addCard({ eyebrow: "Final step", title: "Review, then decide" });
-  const note = document.createElement("p");
-  note.className = "card-note";
-  note.textContent = `Everything I filled is on the page for you to review. I never press "${target.text}" on my own. When you are happy, press it yourself or ask me to.`;
-  body.append(note);
-  actions.append(
-    makeButton(`Click "${target.text}" for me`, "primary", async () => {
-      card.remove();
-      const reply = await sendToPage({ type: "KEEL_CLICK", fieldId: target.id }).catch((error) => ({ ok: false, error: error.message }));
-      if (reply?.ok) {
-        addTimeline(`Clicked "${reply.label}" with your approval.`);
-        if (walkAway) notify("Keel submitted with your approval", `"${reply.label}" was clicked on ${session.snapshot.host}.`);
-      } else {
-        addMsg(reply?.error || "I could not click that button.", "warning");
-      }
-    }),
-    makeButton("I will review first", "secondary", () => { card.remove(); addTimeline("Left the final step to you."); })
-  );
-}
-
-function notify(title, message) {
-  try {
-    chrome.notifications.create({
-      type: "basic",
-      iconUrl: "icons/icon128.png",
-      title: humanizeText(title),
-      message: humanizeText(message)
-    });
-  } catch (_) {}
-}
-
-// ---------------------------------------------------------------------------
-// Attach to the active tab: snapshot, classify, propose
-// ---------------------------------------------------------------------------
-function describeIntentGuess(intent, snapshot) {
-  const label = INTENT_LABELS[intent.kind] || "a form";
-  if (intent.kind === "none") {
-    return `I am watching ${snapshot.host}. I do not see a form here yet. When you land on one, I will size it up.`;
-  }
-  const opener = intent.source === "memory"
-    ? `Back on ${snapshot.host}. Last time you told me this is ${label}, so I will treat it that way.`
-    : `This looks like ${label} on ${snapshot.host}.`;
-  return `${opener} Say "go ahead" and I will draft every field for your approval. If I guessed wrong, just tell me what this page really is.`;
-}
-
-function renderIntentChips() {
-  const wrap = document.createElement("div");
-  wrap.className = "intent-chips";
-  const choices = ["job_application", "signup", "checkout", "booking", "contact", "survey", "form"];
-  for (const kind of choices) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.textContent = INTENT_LABELS[kind];
-    if (session.intent?.kind === kind) chip.classList.add("active");
-    chip.addEventListener("click", () => correctIntent(kind));
-    wrap.append(chip);
-  }
-  const container = document.createElement("div");
-  container.className = "msg keel";
-  container.textContent = "";
-  container.append(wrap);
-  thread.append(container);
-  scrollToEnd();
-}
-
-async function correctIntent(kind) {
-  if (!session?.snapshot) return;
-  session.intent = { kind, confidence: 1, source: "user" };
-  profile.domains[session.snapshot.host] = profile.domains[session.snapshot.host] || {};
-  profile.domains[session.snapshot.host].intent = kind;
-  await saveProfile(profile);
-  addMsg(`Got it, treating this as ${INTENT_LABELS[kind]}. I will remember that for ${session.snapshot.host}.`);
-  addTimeline(`Intent corrected to ${INTENT_LABELS[kind]}. Saved for this site.`);
-  await proposePlan();
-}
-
-async function refreshSnapshot() {
-  if (!currentTab?.id) return null;
-  try {
-    const reply = await sendToPage({ type: "KEEL_SNAPSHOT" });
-    if (reply?.ok) {
-      session.snapshot = reply.snapshot;
-      return reply.snapshot;
-    }
-  } catch (_) {}
-  return null;
-}
-
-async function attachToTab(force = false) {
-  const sequence = ++attachSequence;
-  let tab;
-  try {
-    [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  } catch (_) { return; }
-  if (!tab?.id || !tab.url) return;
-
-  const restricted = /^(chrome|edge|about|chrome-extension|devtools|view-source):/.test(tab.url) || /chrome\.google\.com\/webstore/.test(tab.url);
-  if (restricted) {
-    contextLine.textContent = "This page is off limits to extensions";
-    return;
-  }
-
-  const host = (() => {
+  const actions = document.createElement("div");
+  actions.className = "card-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "danger";
+  button.textContent = `Click ${commit.text || "Submit"}`;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
     try {
-      const parsed = new URL(tab.url);
-      if (parsed.hostname) return parsed.hostname;
-      if (parsed.protocol === "file:") return parsed.pathname.split("/").pop() || "this local file";
-      return tab.url;
-    } catch (_) { return tab.url; }
-  })();
-  const samePage = currentTab?.id === tab.id && currentTab?.url === tab.url;
-  if (samePage && !force) return;
-
-  currentTab = { id: tab.id, url: tab.url, host, title: tab.title || "" };
-  session = newSession();
-  contextLine.textContent = host;
-
-  try {
-    await ensureContentScript(tab.id);
-  } catch (error) {
-    if (sequence === attachSequence) {
-      addMsg(`I cannot see ${host} yet: ${error.message} Refresh the tab and I will try again.`, "warning");
+      const result = await sendToPage({ type: "KEEL_CLICK", fieldId: commit.id }, tabId);
+      if (!result?.ok) throw new Error(result?.error || "The page rejected the click.");
+      addTimeline(`Clicked ${result.label}. This happened only after your approval.`);
+      card.remove();
+    } catch (error) {
+      addMessage(error.message, "keel", "warning");
+      button.disabled = false;
     }
-    return;
-  }
-  if (sequence !== attachSequence) return;
-
-  const snapshot = await refreshSnapshot();
-  if (!snapshot || sequence !== attachSequence) return;
-
-  session.intent = await classifyPage(snapshot);
-  if (sequence !== attachSequence) return;
-
-  addTimeline(`Attached to ${host}${snapshot.webmcp?.available ? " (this page offers WebMCP tools, I will prefer them)" : ""}.`);
-  addMsg(describeIntentGuess(session.intent, snapshot));
-  if (session.intent.kind !== "none") {
-    renderIntentChips();
-    if (session.intent.kind === "job_application") await jobModuleOnboarding();
-    if (walkAway) {
-      addTimeline("Walk-away mode is on. Working through the page on my own.");
-      await proposePlan({ autoApply: true });
-    }
-  }
+  });
+  actions.append(button);
+  card.append(actions);
 }
 
-// ---------------------------------------------------------------------------
-// Plan proposal entry point
-// ---------------------------------------------------------------------------
-async function proposePlan({ autoApply = false } = {}) {
-  if (!session?.snapshot) {
-    addMsg("I am not attached to a page yet. Open the form you want me to work on.", "warning");
+async function makeTailoredResume() {
+  if (!session.resume.parsed || !session.jobDescription.provided) {
+    await advanceConversation();
     return;
   }
-  const sequence = attachSequence;
-  await refreshSnapshot();
-  if (sequence !== attachSequence) return;
-
-  if (!session.snapshot.fields.length) {
-    addMsg("I do not see any fillable fields on this page.", "warning");
-    return;
-  }
-
-  addTimeline(`Scanned ${session.snapshot.fields.length} fields (text, dropdowns, radios, checkboxes, files).`);
-  const plan = await buildPlan(sequence);
-  if (sequence !== attachSequence) return;
-  session.plan = plan;
-
-  // Job surface: draft open-ended questions from the resume and job description.
-  if (session.intent?.kind === "job_application") {
-    await draftOpenQuestions(plan, sequence);
-    if (sequence !== attachSequence) return;
-  }
-
-  const editableRows = renderPlanCard(plan);
-
-  if (autoApply) {
-    // Walk-away: apply only what Keel is confident about, leave the rest previewed.
-    for (const { row, check } of editableRows) {
-      if (check.checked && row.confidence < 0.75) check.checked = false;
-    }
-    await applyPlan(editableRows, plan);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Job application module (the beachhead, layered on the generic engine)
-// ---------------------------------------------------------------------------
-async function jobModuleOnboarding() {
-  const resume = await getDocument("resume");
-  const missing = [];
-  if (!resume) missing.push("your resume (upload it with the paperclip, or paste the text)");
-  if (!session.jobDescription) missing.push("the job description (paste it, or share the posting link)");
-  if (missing.length) {
-    addMsg(`To do a proper job here I want ${missing.join(" and ")}. I can also start right away with what your profile already holds.`);
-  } else {
-    addMsg("I have your resume and the job description, so I can tailor answers to what this team is looking for.");
-  }
-}
-
-async function draftOpenQuestions(plan, sequence) {
-  const resume = await getDocument("resume");
-  const resumeText = resume?.text || profile.work?.workHistory || "";
-  if (!resumeText && !session.jobDescription) return;
-
-  const openRows = plan.rows.filter((r) => !r.keep && !r.proposed && isOpenEndedQuestion(r.field));
-  for (const row of openRows.slice(0, 6)) {
-    const draft = await answerOpenQuestion({
-      question: row.field.label,
-      resumeText,
-      jobDescription: session.jobDescription || "",
-      profileSummary: profileSummaryText(profile),
-      maxLength: row.field.maxLength
-    });
-    if (sequence !== attachSequence) return;
-    if (draft) {
-      row.proposed = draft;
-      row.source = "drafted from your resume";
-      row.confidence = 0.6;
-      row.include = true;
-      row.drafted = true;
-      row.needsAnswer = false;
-    }
-  }
-}
-
-async function runTailorResume() {
-  const resume = await getDocument("resume");
-  if (!resume?.text) {
-    addMsg("I need your resume text first. Upload it with the paperclip (a .txt or .md file works best) or paste it here after saying: here is my resume.", "warning");
-    return;
-  }
-  if (!session?.jobDescription) {
-    addMsg("Share the job description first: paste it, or send the posting link.", "warning");
-    return;
-  }
-  addMsg("Tailoring your resume to this job. Give me a moment.");
-  const tailored = await tailorResume({
-    resumeText: resume.text,
-    jobDescription: session.jobDescription,
+  addTimeline("Drafting a tailored resume from verified source material");
+  const text = await tailorResume({
+    resumeText: session.resume.text,
+    jobDescription: session.jobDescription.text,
     profileSummary: profileSummaryText(profile)
   });
-  if (!tailored) {
-    addMsg("I could not reach my writing engine just now. Try again in a minute.", "warning");
-    return;
-  }
-
-  const { body, actions, card } = addCard({ eyebrow: "Tailored resume", title: "Read it before we use it" });
+  if (!text) throw new Error("I could not draft the tailored resume right now. Your original resume is still saved.");
+  const name = `${(session.resume.summary?.name || "resume").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase()}-tailored.pdf`;
+  const doc = await saveDocument("tailoredResume", { name, mime: "application/pdf", dataBase64: makeResumePdfBase64("Tailored resume", text), text });
+  documents.tailoredResume = doc;
+  const { body } = addCard("Tailored resume draft", "DOCUMENT PREVIEW");
   const preview = document.createElement("div");
   preview.className = "doc-preview";
-  preview.textContent = tailored;
+  preview.textContent = text;
   body.append(preview);
-  actions.append(
-    makeButton("Save as PDF for this application", "primary", async () => {
-      const name = `${(flatProfile(profile).fullName || "Resume").replace(/[^A-Za-z0-9]+/g, "-")}-tailored.pdf`;
-      const dataBase64 = makeResumePdfBase64(flatProfile(profile).fullName || "Resume", tailored);
-      await saveDocument("tailoredResume", { name, mime: "application/pdf", dataBase64, text: tailored });
-      card.remove();
-      addTimeline(`Saved tailored resume as ${name}. I will offer it whenever this page asks for a resume.`);
-      const fileField = session.snapshot?.fields.find((f) => f.type === "file" && /\b(resume|cv)\b/.test(f.meta));
-      if (fileField) await offerFileAttach(fileField);
-    }),
-    makeButton("Discard", "secondary", () => { card.remove(); addTimeline("Discarded the tailored draft."); })
-  );
+  addMessage("I saved this as a real PDF. It only rewords facts from your original resume and does not invent experience.");
 }
 
-async function ingestJobDescription(source) {
-  let text = source;
-  if (/^https?:\/\/\S+$/i.test(source.trim())) {
-    addMsg("Fetching that job posting.");
-    try {
-      text = await fetchJobDescription(source.trim());
-    } catch (error) {
-      addMsg(`I could not read that link (${error.message}) Paste the description text instead.`, "warning");
+async function handleUserMessage(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text || busy) return;
+  const key = inputKey(text);
+  if (session.processedInputs.includes(key)) return;
+  session.processedInputs.push(key);
+  if (session.processedInputs.length > 100) session.processedInputs = session.processedInputs.slice(-100);
+  addMessage(text, "user");
+  await persistSession();
+  busy = true;
+  try {
+    if (/\bundo\b/i.test(text)) { await undoLastFill(); return; }
+    if (isNegative(text)) { session.approvalToProceed = false; session.phase = "waiting"; session.lastQuestionKey = null; addMessage("Okay. I will wait. Tell me when you want to continue."); await persistSession(); return; }
+
+    const localUpdates = applyNaturalProfileUpdates(text);
+    const model = await interpretWithModel(text);
+    await applyProfileUpdates({ ...localUpdates, ...(model?.profileUpdates || {}) });
+
+    const modelJobText = model?.jobDescriptionText;
+    if (modelJobText && !session.jobDescription.provided) { await storeJobDescription(modelJobText); return; }
+    if (looksLikeUrl(text) || (looksLikeJobDescription(text) && !isAffirmative(text))) { await storeJobDescription(text); return; }
+
+    const action = model?.action || "none";
+    if (/\b(tailor|rewrite|customize)\b.*\b(resume|cv)\b/i.test(text) || action === "tailor_resume") { await makeTailoredResume(); return; }
+    if (isAffirmative(text) || action === "start" || action === "preview") {
+      const missing = missingSlots();
+      if (missing.length) { await advanceConversation(); return; }
+      await preparePlan();
       return;
     }
-  }
-  session.jobDescription = text;
-  if (session.snapshot?.host) {
-    profile.domains[session.snapshot.host] = profile.domains[session.snapshot.host] || {};
-    await saveProfile(profile);
-  }
-  addTimeline("Job description saved for this session.");
-  addMsg("Got the job description. Now I know what the recruiter is looking for. Say \"tailor my resume\" or \"go ahead\" to start filling.");
-}
 
-async function learnFromResumeText(text) {
-  const result = await assist("extract_profile", {
-    resumeText: text.slice(0, 16000),
-    knownKeys: Object.keys(PROFILE_FIELD_LABELS)
-  }, { timeoutMs: 30000 });
-  const parsed = result?.text ? parseLooseJson(result.text) : null;
-  if (!parsed || typeof parsed !== "object") return 0;
-  let learned = 0;
-  const flat = flatProfile(profile);
-  for (const [key, value] of Object.entries(parsed)) {
-    if (!PROFILE_FIELD_LABELS[key] || !value || flat[key]) continue;
-    setProfileValue(profile, key, String(value));
-    learned += 1;
-  }
-  if (learned) await saveProfile(profile);
-  return learned;
-}
-
-// ---------------------------------------------------------------------------
-// File uploads (paperclip)
-// ---------------------------------------------------------------------------
-function readFileAsBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
-    reader.onerror = () => reject(new Error("Could not read the file."));
-    reader.readAsDataURL(file);
-  });
-}
-
-function readFileAsText(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("Could not read the file."));
-    reader.readAsText(file);
-  });
-}
-
-async function handleUpload(file) {
-  addMsg(`Uploaded ${file.name}`, "user");
-  const isTexty = /\.(txt|md|markdown|text)$/i.test(file.name) || file.type.startsWith("text/");
-  const looksResume = /resume|cv/i.test(file.name);
-  const looksCover = /cover/i.test(file.name);
-  const kind = looksCover ? "coverLetter" : "resume";
-
-  const dataBase64 = await readFileAsBase64(file);
-  let text = "";
-  if (isTexty) {
-    text = await readFileAsText(file);
-  }
-
-  await saveDocument(kind, { name: file.name, mime: file.type || "application/octet-stream", dataBase64, text });
-
-  if (kind === "resume") {
-    let reply = `Saved ${file.name} as your resume. I can attach it to any resume upload from now on.`;
-    if (text) {
-      const learned = await learnFromResumeText(text);
-      if (learned) reply += ` I also learned ${learned} profile detail${learned === 1 ? "" : "s"} from it.`;
-    } else {
-      reply += " I cannot read text out of this file type, so paste the resume text here too and I will learn from it and use it for tailored answers.";
+    if (Object.keys(localUpdates).length || Object.keys(model?.profileUpdates || {}).length) {
+      addMessage("Saved to your reusable profile. I will use it on this form and future forms.");
+      await advanceConversation();
+      return;
     }
-    addMsg(reply, "success");
-  } else {
-    addMsg(`Saved ${file.name} as your cover letter.`, "success");
-  }
 
-  const fileField = session?.snapshot?.fields.find((f) => f.type === "file");
-  if (fileField && (looksResume || looksCover)) await offerFileAttach(fileField);
-}
-
-// ---------------------------------------------------------------------------
-// Chat: commands first, then the conversational brain
-// ---------------------------------------------------------------------------
-async function setWalkAway(enabled, { silent = false } = {}) {
-  walkAway = enabled;
-  walkawayToggle.checked = enabled;
-  await chrome.storage.local.set({ keelWalkAway: enabled });
-  if (silent) return;
-  addMsg(enabled
-    ? "Walk-away mode is on. I will keep working through pages on my own, fill what I am confident about, draft the rest, and send you a notification when I am done or stuck. I still never submit without your approval."
-    : "Walk-away mode is off. I will wait for your go-ahead at each step.");
-}
-
-const INTENT_SYNONYMS = {
-  "signup": "signup", "sign up": "signup", "registration": "signup", "register": "signup", "create account": "signup",
-  "checkout": "checkout", "payment": "checkout", "purchase": "checkout", "order": "checkout",
-  "job": "job_application", "job application": "job_application", "application": "job_application",
-  "login": "login", "log in": "login", "sign in": "login",
-  "booking": "booking", "reservation": "booking", "appointment": "booking",
-  "contact": "contact", "contact form": "contact",
-  "survey": "survey", "questionnaire": "survey", "intake": "survey",
-  "newsletter": "subscription", "subscription": "subscription",
-  "profile": "profile_update", "account settings": "profile_update",
-  "form": "form"
-};
-
-async function handleCommand(text) {
-  const lower = text.toLowerCase().trim();
-
-  if (/^(undo|undo that|undo the last|undo last fill)\b/.test(lower)) { await undoLastFill(); return true; }
-  if (/\b(rescan|scan again|look again|re-read the page)\b/.test(lower)) { await attachToTab(true); return true; }
-  if (/^(go ahead|do it|fill( the form| it| everything)?|start|proceed|make the plan|draft the fields)\b/.test(lower)) { await proposePlan(); return true; }
-  if (/\b(walk away|autopilot on|keep going without me)\b/.test(lower)) { await setWalkAway(true); return true; }
-  if (/\b(i'?m back|autopilot off|stop autopilot|wait for me)\b/.test(lower)) { await setWalkAway(false); return true; }
-  if (/\b(tailor|tailored resume|adapt my resume|customize my resume)\b/.test(lower)) { await runTailorResume(); return true; }
-  if (/\b(draft the open questions|draft the questions|answer the open questions)\b/.test(lower)) { await proposePlan(); return true; }
-  if (/\b(what do you know about me|show (my )?profile|show memory)\b/.test(lower)) {
-    const summary = profileSummaryText(profile);
-    addMsg(summary ? `Here is what I hold in your profile:\n${summary}` : "Your profile is empty so far. Tell me things like: my name is Ada Okoye, my email is ada@example.com. I also learn from every answer you approve.");
-    return true;
-  }
-  if (/\b(continue|done|i did it|i handled it|resume)\b/.test(lower) && session?.snapshot?.captchaPresent) {
-    await refreshSnapshot();
-    addTimeline("Continuing after your turn.");
-    await proposePlan();
-    return true;
-  }
-
-  // Intent correction: "this is a signup", "it's a checkout", "no, checkout"
-  const intentMatch = lower.match(/\b(?:this is|it'?s|its|treat (?:this|it) as|actually)\s+(?:a |an )?([a-z ]{3,25})/);
-  if (intentMatch) {
-    const guess = intentMatch[1].trim();
-    for (const [phrase, kind] of Object.entries(INTENT_SYNONYMS)) {
-      if (guess.startsWith(phrase) || phrase.startsWith(guess)) {
-        await correctIntent(kind);
-        return true;
+    if (/\b(i already told you|stop asking|do not ask again|don't ask again)\b/i.test(text)) {
+      const missing = missingSlots();
+      if (!missing.length) {
+        addMessage(`${readinessSummary()}. I will move straight to the preview.`);
+        await preparePlan();
+      } else {
+        await advanceConversation();
       }
+      return;
     }
-  }
 
-  // Memory writes: "remember my shirt size is large", "my email is x@y.z"
-  const rememberMatch = text.match(/(?:remember (?:that )?)?my ([a-z0-9 /-]{2,40}) is (.{1,200})/i);
-  if (rememberMatch && /(remember|my)/i.test(lower)) {
-    const what = rememberMatch[1].trim();
-    const value = rememberMatch[2].trim().replace(/[.!]+$/, "");
-    const directKeys = { "name": "fullName", "full name": "fullName", "email": "email", "email address": "email", "phone": "phone", "phone number": "phone", "address": "addressLine1" };
-    const keyHit = (directKeys[what.toLowerCase()] ? [directKeys[what.toLowerCase()]] : null)
-      || Object.entries(PROFILE_FIELD_LABELS).find(([, label]) => label.toLowerCase() === what.toLowerCase())
-      || LABEL_RULES.find(([, pattern]) => pattern.test(what.toLowerCase()));
-    if (keyHit) {
-      setProfileValue(profile, keyHit[0], value);
-    } else {
-      profile.preferences[what.toLowerCase()] = value;
-    }
-    await saveProfile(profile);
-    addMsg(`Noted. Your ${what} is ${value}. I will use that anywhere it fits.`, "success");
-    return true;
-  }
-
-  // Job description via link or explicit paste
-  if (/^https?:\/\/\S+$/i.test(text.trim()) && session?.intent?.kind === "job_application") {
-    await ingestJobDescription(text.trim());
-    return true;
-  }
-  if (/^(here is|here'?s) the (job description|jd)/i.test(text) || (/job description[:\n]/i.test(text) && text.length > 300)) {
-    await ingestJobDescription(text.replace(/^(here is|here'?s) the (job description|jd)[:,]?\s*/i, ""));
-    return true;
-  }
-  if (/^(here is|here'?s) my resume/i.test(text) && text.length > 300) {
-    const resumeText = text.replace(/^(here is|here'?s) my resume[:,]?\s*/i, "");
-    await saveDocument("resume", { name: "resume.txt", mime: "text/plain", dataBase64: btoa(unescape(encodeURIComponent(resumeText))), text: resumeText });
-    const learned = await learnFromResumeText(resumeText);
-    addMsg(`Saved your resume text${learned ? ` and learned ${learned} profile detail${learned === 1 ? "" : "s"} from it` : ""}. I can now tailor it to a job and answer open questions from it.`, "success");
-    return true;
-  }
-
-  return false;
-}
-
-async function handleChat(text) {
-  const handled = await handleCommand(text);
-  if (handled) return;
-
-  // Fall through to the conversational brain with page context.
-  const context = {
-    host: session?.snapshot?.host || null,
-    pageTitle: session?.snapshot?.title || null,
-    intent: session?.intent?.kind || null,
-    fieldLabels: (session?.snapshot?.fields || []).slice(0, 30).map((f) => f.label),
-    hasResume: Boolean(await getDocument("resume")),
-    hasJobDescription: Boolean(session?.jobDescription),
-    walkAway
-  };
-  const result = await assist("chat", { message: text, context, profileSummary: profileSummaryText(profile) }, { timeoutMs: 30000 });
-  if (result?.text) {
-    const structured = parseLooseJson(result.text);
-    if (structured?.reply) {
-      addMsg(structured.reply);
-      if (structured.action === "propose_plan") await proposePlan();
-      if (structured.action === "set_intent" && INTENT_LABELS[structured.intent]) await correctIntent(structured.intent);
-      if (structured.action === "remember" && structured.key && structured.value) {
-        profile.preferences[String(structured.key).toLowerCase()] = String(structured.value);
-        await saveProfile(profile);
-        addTimeline(`Remembered: ${structured.key} is ${structured.value}.`);
-      }
-    } else {
-      addMsg(result.text);
-    }
-    return;
-  }
-
-  // Offline fallback: stay useful without the language brain.
-  addMsg("I am having trouble reaching my language engine, but the essentials still work. Say \"go ahead\" to draft this page, \"undo\" to roll back, or tell me facts like: my email is ada@example.com.");
-}
-
-// ---------------------------------------------------------------------------
-// Composer, voice, upload wiring
-// ---------------------------------------------------------------------------
-function autoGrowComposer() {
-  composerInput.style.height = "auto";
-  composerInput.style.height = `${Math.min(composerInput.scrollHeight, 120)}px`;
-}
-
-async function submitComposer() {
-  const text = composerInput.value.trim();
-  if (!text) return;
-  composerInput.value = "";
-  autoGrowComposer();
-  addMsg(text, "user");
-  try {
-    await handleChat(text);
+    if (model?.reply) addMessage(model.reply);
+    else await advanceConversation();
   } catch (error) {
-    addMsg(`Something went wrong: ${error.message}`, "warning");
+    addMessage(error.message || "Something went wrong. I kept your saved information and did not change the page.", "keel", "warning");
+    await notify("Keel needs you", error.message || "Open Keel to continue.");
+  } finally {
+    busy = false;
+    await persistSession();
   }
 }
 
-sendButton.addEventListener("click", submitComposer);
-composerInput.addEventListener("keydown", (event) => {
+async function handleFile(file) {
+  if (!file || busy) return;
+  busy = true;
+  addMessage(`Uploaded ${file.name}`, "user");
+  addTimeline("Reading the resume contents");
+  try {
+    await ingestResume(file);
+  } catch (error) {
+    session.resume = { uploaded: true, parsed: false, fileName: file.name, summary: null, text: null, error: error.message };
+    await persistSession();
+    addMessage(`I could not parse ${file.name}: ${error.message}`, "keel", "warning");
+    await notify("Keel could not read the resume", error.message);
+  } finally {
+    busy = false;
+    fileInput.value = "";
+  }
+}
+
+function autoGrow() {
+  composer.style.height = "auto";
+  composer.style.height = `${Math.min(composer.scrollHeight, 120)}px`;
+}
+
+sendButton.addEventListener("click", () => {
+  const text = composer.value;
+  composer.value = "";
+  autoGrow();
+  handleUserMessage(text);
+});
+composer.addEventListener("input", autoGrow);
+composer.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
-    submitComposer();
+    sendButton.click();
   }
 });
-composerInput.addEventListener("input", autoGrowComposer);
+attachButton.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => handleFile(fileInput.files?.[0]));
+walkawayToggle.addEventListener("change", () => chrome.storage.local.set({ [WALKAWAY_KEY]: walkawayToggle.checked }));
 
 const voice = new VoiceInput({
-  onPartial: (text) => { composerInput.value = text; autoGrowComposer(); },
-  onFinal: (text) => {
-    composerInput.value = text;
-    autoGrowComposer();
-    if (text.trim()) submitComposer();
-  },
+  onPartial: (text) => { composer.value = text; autoGrow(); },
+  onFinal: (text) => { composer.value = ""; autoGrow(); handleUserMessage(text); },
   onState: (state) => {
-    micButton.classList.toggle("recording", state === "listening");
-    voiceHint.hidden = state !== "listening";
+    const listening = state === "listening";
+    micButton.classList.toggle("recording", listening);
+    voiceHint.hidden = !listening;
   },
-  onError: (message) => addMsg(message, "warning")
+  onError: (message) => addMessage(message, "keel", "warning")
 });
-
 micButton.addEventListener("click", () => {
-  if (micButton.classList.contains("recording")) voice.stop();
+  if (voice.wantListening) voice.stop();
   else voice.start();
 });
 
-attachButton.addEventListener("click", () => fileInput.click());
-fileInput.addEventListener("change", async () => {
-  const file = fileInput.files?.[0];
-  fileInput.value = "";
-  if (!file) return;
-  if (file.size > 8 * 1024 * 1024) {
-    addMsg("That file is over 8 MB, which is more than I can hold in memory. Use a smaller file.", "warning");
-    return;
-  }
-  try {
-    await handleUpload(file);
-  } catch (error) {
-    addMsg(`I could not process that file: ${error.message}`, "warning");
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  activeTabId = tabId;
+  snapshot = null;
+  if (!busy) await refreshContext();
+});
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (tabId !== activeTabId || !changeInfo.url) return;
+  snapshot = null;
+  await refreshContext();
+});
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== "KEEL_EVENT") return;
+  if (message.kind === "fields_changed") {
+    addTimeline("The page changed. Keel will rescan the active tab before the next action.");
+    snapshot = null;
   }
 });
 
-walkawayToggle.addEventListener("change", () => setWalkAway(walkawayToggle.checked));
-
-// ---------------------------------------------------------------------------
-// Events from the page
-// ---------------------------------------------------------------------------
-chrome.runtime.onMessage.addListener((event, sender) => {
-  if (event?.type !== "KEEL_EVENT") return;
-  if (!sender.tab?.id || sender.tab.id !== currentTab?.id) return;
-
-  if (event.kind === "fields_changed") {
-    addTimeline("The page changed its fields (a new step, most likely). Say \"rescan\" or \"go ahead\" and I will re-read it.");
-    refreshSnapshot();
+async function init() {
+  const stored = await chrome.storage.local.get([SESSION_KEY, WALKAWAY_KEY]);
+  session = stored[SESSION_KEY]?.version === 3 ? { ...freshSession(), ...stored[SESSION_KEY] } : freshSession();
+  session.resume = { ...freshSession().resume, ...(session.resume || {}) };
+  session.jobDescription = { ...freshSession().jobDescription, ...(session.jobDescription || {}) };
+  session.history = Array.isArray(session.history) ? session.history : [];
+  session.processedInputs = Array.isArray(session.processedInputs) ? session.processedInputs : [];
+  walkawayToggle.checked = Boolean(stored[WALKAWAY_KEY]);
+  [profile, documents] = await Promise.all([loadProfile(), loadDocuments()]);
+  if (documents.resume?.text && !session.resume.parsed) {
+    session.resume = { uploaded: true, parsed: true, fileName: documents.resume.name, summary: documents.resume.summary || fallbackResumeFacts(documents.resume.text), text: documents.resume.text, error: null };
   }
+  renderStoredHistory();
+  await refreshContext({ announce: true });
+  if (!session.history.length) addMessage("Hi, I am Keel. Show me the form, share what is missing, and I will draft the work for your approval.");
+  if (session.history.length <= 1 || session.phase === "discovering") await advanceConversation();
+  await persistSession();
+}
+
+init().catch((error) => {
+  console.error("Keel initialization failed", error);
+  addMessage("Keel could not initialize. Reload the extension and try again.", "keel", "warning");
 });
-
-// Follow the user's ACTIVE tab, always.
-chrome.tabs.onActivated.addListener(() => attachToTab());
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && tab.active) attachToTab(true);
-});
-
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-(async function init() {
-  profile = await loadProfile();
-  documents = await loadDocuments();
-  const stored = await chrome.storage.local.get(["keelThread", "keelWalkAway"]);
-  threadLog = stored.keelThread || [];
-  await setWalkAway(Boolean(stored.keelWalkAway), { silent: true });
-
-  // Restore a light history so the thread feels continuous.
-  for (const entry of threadLog.slice(-30)) {
-    if (entry.kind === "msg") addMsg(entry.text, entry.tone, { persist: false });
-    else if (entry.kind === "timeline") {
-      const node = document.createElement("div");
-      node.className = "timeline-entry";
-      node.innerHTML = "";
-      const dot = document.createElement("span");
-      dot.className = "dot";
-      dot.textContent = "\u2022";
-      const label = document.createElement("span");
-      label.textContent = entry.text;
-      node.append(dot, label);
-      thread.append(node);
-    }
-  }
-  // De-duplicate persistence: entries above were already stored.
-  threadLog = stored.keelThread || [];
-
-  if (!threadLog.length) {
-    addMsg("Hey, I am Keel. Any time a page asks you to introduce yourself again, that is my job: signups, checkouts, registrations, applications, all of it. I read the page you are on, draft every field from what I know about you, and show you everything before it touches the page. Talk to me, use the mic, or drop in a file. The more you correct me, the better I remember.");
-  }
-  await attachToTab(true);
-})();

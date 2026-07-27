@@ -87,8 +87,8 @@
 
     <fieldset>
       <legend>Documents and account</legend>
-      <label for="resume">Resume (PDF or text) *</label>
-      <input id="resume" name="resume" type="file" required />
+      <label for="resume">Resume (PDF, DOCX, or TXT) *</label>
+      <input id="resume" name="resume" type="file" accept=".pdf,.docx,.txt,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required />
       <label for="password">Create a password for your applicant account *</label>
       <input id="password" name="password" type="password" autocomplete="new-password" required />
       <label class="inline"><input type="checkbox" name="terms" required /> I agree to the terms and privacy policy *</label>

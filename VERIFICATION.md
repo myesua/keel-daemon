@@ -96,6 +96,7 @@ Two gates, both observed in the run:
 - **Persistent memory.** The panel document was reloaded, which is what happens when the side panel closes and reopens. Asked "do you still have my details and the job description?", Keel answered yes and repeated the role, the stack, and the experience requirement back correctly, with no re-asking. [screenshot](https://storage.googleapis.com/audos-images/chat-attachments/c3188285-c226-4bf3-bdcd-baf6aa4c716f.png)
 - **No console errors** were logged by the panel during the run.
 - **Fallback brain.** The `keel-assist` workspace hook gained an `agent_turn` task so the loop still works if the direct model route is unavailable. Called live, it returned valid decision JSON in 1.2 seconds. It has no screenshot, and it is instructed to say so rather than pretend.
+- **Read back from GitHub.** After the push, the branch was downloaded fresh from GitHub, loaded into Chrome as an unpacked extension, and put through the same run. Every check passed on the code that is actually in the repository.
 
 ## The bug behind "the agent cannot see my screen"
 
